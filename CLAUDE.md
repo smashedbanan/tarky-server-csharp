@@ -32,75 +32,22 @@ setup is needed here and normal PRs touching them are fine.
 
 ## Architecture
 
-Five projects matter: `SPTarkov.Server` (host/entry point + mod loading), `Libraries/SPTarkov.Server.Core` (all game
-logic), `Libraries/SPTarkov.Server.Web` (Blazor admin panel), `Libraries/SPTarkov.DI` (the attribute-driven container),
-`Libraries/SPTarkov.Server.Assets` (SPT_Data: configs, JSON database, images; the largest JSON files ship as
-`looseLoot.7z`, see Commands above).
+Full reference: [ARCHITECTURE.md](ARCHITECTURE.md) — solution layout, request pipeline, DI, startup order,
+persistence, websockets, admin panel, mods, build-time codegen. The rules that keep changes correct:
 
-### Request pipeline
-
-The server is ASP.NET Core but does **not** use MVC controllers or attribute routing. `Program.cs` installs one
-catch-all middleware into `HttpServer.HandleRequestAsync`, which picks an `IHttpListener` (normally `SptHttpListener`).
-From there:
-
-```
-HttpRouter → StaticRouter (exact URL match) or DynamicRouter (substring match)
-           → *Callbacks (deserialize/serialize, HttpResponseUtil.GetBody)
-           → *Controller (orchestration)
-           → Services / Helpers / Generators (logic)  ←→ Database tables (DI singletons)
-```
-
-Routers are declarative: a router subclass passes a list of `RouteAction<TRequest>` records to its base constructor
-(see `Routers/Static/WeatherStaticRouter.cs`). Adding an endpoint means touching the router, the callback, and usually
-a controller — not adding an `[HttpGet]`.
-
-`/client/game/profile/items/moving` fans out through `ItemEventRouter` subclasses in `Routers/ItemEvents/` instead,
-keyed by the action name in the body. `SaveLoadRouter` subclasses run on profile load to migrate/patch saved data.
-
-### Dependency injection
-
-Classes are registered by putting `[Injectable]` on them; `DependencyInjectionHandler` scans assemblies and registers
-each type against itself, its interfaces, and its base types. `InjectionType` selects Singleton/Transient/Scoped/
-HostedService. `[Injectable(TypePriority = ...)]` controls both registration order and load order.
-
-`ProgramHelpers.RegisterSptServicesAsync` is the single place every service gets registered — `DependencyInjectionValidationTests`
-builds the exact same container (with mods on and off) so a broken registration fails the test run rather than a
-launch. Keep new registrations there.
-
-Lifecycle interfaces in `Core/DI/`:
-- `IOnLoad` — startup work, ordered by `OnLoadOrder` constants (`Watermark` → `Preload` → `GameCallbacks` → … →
-  `PostLoad`). Anything below `GameCallbacks` runs pre-web-start via `RunPreSptLoadCallbacks` (this is what lets mods
-  mutate `HttpConfig` before Kestrel binds); the rest runs in `SPTStartupHostedService`.
-- `IOnUpdate` — polled every 5s by `SPTStartupHostedService`.
-- `IOnDIConstruct` — static hook letting a mod add its own registrations.
-
-### Startup order
-
-`ProgramStatics.Initialize` → early logger → `ConfigLoader` (maps `SPT_Data/configs/*.json` to `BaseConfig` types via
-the `ConfigTypes` enum) → throwaway "early" provider → `ModLoader` (validate, prepatch, load assemblies) →
-`DatabaseImporter` (hash-verified outside DEBUG) → real `WebApplicationBuilder` with database tables registered as
-singletons → pre-SPT-load callbacks → Kestrel on HTTPS with a self-generated cert.
-
-The mod-loading split in `Program.StartServerAfterModLoading` is deliberate: merging it back breaks prepatching by
-forcing types into context too early.
-
-### Mods
-
-A mod DLL in `user/mods/` implements exactly one `IModMetadata` (GUID, semver, `SptVersion` range, dependencies,
-incompatibilities) plus any number of `[Injectable]` classes. `Testing/TestMod` is the reference implementation.
-`HasPrepatcher = true` opts into enum prepatching from `user/patchers/{ModGuid}`. Runtime method patching uses
-`SPTarkov.Reflection` (`AbstractPatch`/`PatchManager`).
-
-### Build-time code generation
-
-Two non-obvious steps run during build, both in `SPTarkov.Server.Core.csproj`:
-- `GenerateProgramStatics` writes `Utils/ProgramStatics.Generated.cs` from MSBuild properties. Never edit it.
-- On Release/publish, `Tools/Ceciler` rewrites the compiled `SPTarkov.Server.Core.dll` with Mono.Cecil, injecting a
-  `[JsonExtensionData]` property into every model type under `Models` so unknown client JSON round-trips instead of
-  being dropped. This means Release binaries differ structurally from Debug ones; `PrepatchIsolationTests` guards it.
-
-`SPTarkov.Server.Assets` hashes SPT_Data into `checks.dat` on Release builds, which `DatabaseImporter` verifies at
-startup.
+- No MVC controllers or attribute routing. An endpoint = router entry (`Routers/Static` or `Routers/Dynamic`) +
+  callback + controller — not an `[HttpGet]`. Item-moving actions go through `Routers/ItemEvents/`; profile-load
+  patches through `Routers/SaveLoad/`.
+- Mark classes `[Injectable]`; every registration lives in `ProgramHelpers.RegisterSptServicesAsync`.
+  `DependencyInjectionValidationTests` rebuilds that exact container (mods on and off), so a bad registration fails
+  the test run, not a launch.
+- Startup work implements `IOnLoad`, ordered by `OnLoadOrder`; anything below `GameCallbacks` runs before Kestrel
+  binds. Periodic work implements `IOnUpdate` (5s poll).
+- Never edit `Utils/ProgramStatics.Generated.cs` (build-generated). On Release, `Tools/Ceciler` IL-rewrites
+  `SPTarkov.Server.Core.dll` (injects `[JsonExtensionData]` into `Models` types), so Release and Debug binaries
+  differ structurally.
+- The mod-loading split in `Program.StartServerAfterModLoading` is deliberate: merging it back breaks prepatching.
+- `DatabaseImporter` hash-verifies `SPT_Data` against `checks.dat` at startup outside DEBUG builds.
 
 ## Style
 
@@ -113,3 +60,13 @@ CSharpier plus `.editorconfig` handle formatting. The rules a formatter can't ca
 - Block bodies for methods/constructors/properties/accessors — no expression-bodied members (lambdas are fine).
 
 AI-generated code is permitted in this fork until a new policy is drafted (CONTRIBUTING.md).
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
