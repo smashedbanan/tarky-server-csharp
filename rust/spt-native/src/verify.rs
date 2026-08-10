@@ -67,6 +67,128 @@ pub fn collect_files(spt_data: &Path) -> Vec<(PathBuf, String)> {
     files
 }
 
+use serde::Serialize;
+
+#[derive(Serialize)]
+pub struct VerifyReport {
+    pub ok: bool,
+    pub failures: Vec<Failure>,
+    pub checked: usize,
+}
+
+#[derive(Serialize)]
+pub struct Failure {
+    pub path: String,
+    pub reason: String,
+}
+
+const MAX_CONCURRENT_HASHES: usize = 32;
+
+pub async fn verify(spt_data: PathBuf) -> VerifyReport {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let manifest_path = spt_data.join("checks.dat");
+    let manifest: HashMap<String, String> = match tokio::fs::read(&manifest_path).await {
+        Ok(raw) => match parse_manifest(&raw) {
+            Ok(manifest) => manifest,
+            Err(e) => return manifest_failure(e),
+        },
+        Err(e) => return manifest_failure(format!("cannot read checks.dat: {e}")),
+    };
+
+    let files = collect_files(&spt_data);
+    let checked = files.len();
+    if checked == 0 {
+        return VerifyReport {
+            ok: false,
+            failures: vec![Failure {
+                path: "database".into(),
+                reason: "no verifiable files found".into(),
+            }],
+            checked: 0,
+        };
+    }
+    let manifest = Arc::new(manifest);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES));
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for (path, key) in files {
+        let manifest = Arc::clone(&manifest);
+        let semaphore = Arc::clone(&semaphore);
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+            check_one(&manifest, &path, key).await
+        });
+    }
+
+    let mut failures: Vec<Failure> = tasks.join_all().await.into_iter().flatten().collect();
+    failures.sort_by(|a, b| a.path.cmp(&b.path));
+
+    VerifyReport {
+        ok: failures.is_empty(),
+        failures,
+        checked,
+    }
+}
+
+async fn check_one(
+    manifest: &std::collections::HashMap<String, String>,
+    path: &Path,
+    key: String,
+) -> Option<Failure> {
+    let Some(expected) = manifest.get(&key) else {
+        return Some(Failure {
+            path: key,
+            reason: "missing_from_manifest".into(),
+        });
+    };
+    let actual = match xxh3_file(path).await {
+        Ok(hash) => hash,
+        Err(e) => {
+            return Some(Failure {
+                path: key,
+                reason: format!("io_error: {e}"),
+            });
+        }
+    };
+    if &actual != expected {
+        return Some(Failure {
+            path: key,
+            reason: "hash_mismatch".into(),
+        });
+    }
+    None
+}
+
+async fn xxh3_file(path: &Path) -> std::io::Result<String> {
+    use tokio::io::AsyncReadExt;
+    use xxhash_rust::xxh3::Xxh3;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Xxh3::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:032X}", hasher.digest128()))
+}
+
+fn manifest_failure(reason: String) -> VerifyReport {
+    VerifyReport {
+        ok: false,
+        failures: vec![Failure {
+            path: "checks.dat".into(),
+            reason: format!("manifest_unreadable: {reason}"),
+        }],
+        checked: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +293,90 @@ mod tests {
         touch(dir.path(), "database/loud.JSON");
         touch(dir.path(), "database/quiet.json");
         assert_eq!(keys(dir.path()), vec!["database/quiet.json".to_string()]);
+    }
+
+    fn write_manifest(spt_data: &Path, entries: &[(&str, &str)]) {
+        use base64::Engine;
+        let items: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(p, h)| serde_json::json!({ "Path": p, "Hash": h }))
+            .collect();
+        let json = serde_json::to_string(&items).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        fs::write(spt_data.join("checks.dat"), b64).unwrap();
+    }
+
+    fn xxh3_hex(data: &[u8]) -> String {
+        format!("{:032X}", xxhash_rust::xxh3::xxh3_128(data))
+    }
+
+    #[test]
+    fn xxh3_known_answer() {
+        // Cross-checked against Python xxhash and System.IO.Hashing.XxHash128 (canonical big-endian).
+        assert_eq!(xxh3_hex(b"abc"), "06B05AB6733A618578AF5F94892F3950");
+    }
+
+    #[tokio::test]
+    async fn clean_tree_verifies_ok() {
+        let dir = TempDir::new().unwrap();
+        touch(dir.path(), "database/globals.json");
+        touch(dir.path(), "database/templates/items.json");
+        write_manifest(
+            dir.path(),
+            &[
+                ("database/globals.json", xxh3_hex(b"{}").as_str()),
+                ("database/templates/items.json", xxh3_hex(b"{}").as_str()),
+            ],
+        );
+        let report = verify(dir.path().to_path_buf()).await;
+        assert!(report.ok);
+        assert_eq!(report.checked, 2);
+        assert!(report.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tampered_file_fails_with_hash_mismatch() {
+        let dir = TempDir::new().unwrap();
+        touch(dir.path(), "database/globals.json");
+        write_manifest(
+            dir.path(),
+            &[("database/globals.json", xxh3_hex(b"{}").as_str())],
+        );
+        fs::write(dir.path().join("database/globals.json"), b"{tampered}").unwrap();
+        let report = verify(dir.path().to_path_buf()).await;
+        assert!(!report.ok);
+        assert_eq!(report.failures[0].path, "database/globals.json");
+        assert_eq!(report.failures[0].reason, "hash_mismatch");
+    }
+
+    #[tokio::test]
+    async fn file_missing_from_manifest_fails() {
+        let dir = TempDir::new().unwrap();
+        touch(dir.path(), "database/extra.json");
+        write_manifest(dir.path(), &[]);
+        let report = verify(dir.path().to_path_buf()).await;
+        assert!(!report.ok);
+        assert_eq!(report.failures[0].path, "database/extra.json");
+        assert_eq!(report.failures[0].reason, "missing_from_manifest");
+    }
+
+    #[tokio::test]
+    async fn missing_checks_dat_fails() {
+        let dir = TempDir::new().unwrap();
+        touch(dir.path(), "database/globals.json");
+        let report = verify(dir.path().to_path_buf()).await;
+        assert!(!report.ok);
+        assert_eq!(report.failures[0].path, "checks.dat");
+        assert!(report.failures[0].reason.starts_with("manifest_unreadable"));
+    }
+
+    #[tokio::test]
+    async fn empty_collection_fails_instead_of_passing_vacuously() {
+        let dir = TempDir::new().unwrap();
+        write_manifest(dir.path(), &[]);
+        let report = verify(dir.path().to_path_buf()).await;
+        assert!(!report.ok);
+        assert_eq!(report.failures[0].path, "database");
+        assert_eq!(report.failures[0].reason, "no verifiable files found");
     }
 }
