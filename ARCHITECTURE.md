@@ -179,9 +179,13 @@ Three C-ABI exports (`src/ffi.rs`), consumed by `Libraries/SPTarkov.Server.Core/
 | `spt_verify_database` | Hashes the tree, returns a heap-allocated JSON `VerifyReport` |
 | `spt_buf_free` | Releases that buffer |
 
-`unsafe` is confined to `ffi.rs` (raw pointer in/out) and `NativeMethods.cs` (`DllImport` +
-`fixed`); `verify.rs`, `runtime.rs` and the C# `SptNative` wrapper are safe code. Every export
-catches panics and maps them to a status code, so a Rust panic can never unwind into the CLR.
+`unsafe` is confined to `ffi.rs` (raw pointer in/out) on the Rust side and, on the C# side, to the
+`[LibraryImport]` declarations in `NativeMethods.cs` plus the one `unsafe` method in `SptNative.cs`
+that pins the path, passes the out-params, and reads the returned buffer as a span; `verify.rs`,
+`runtime.rs` and the rest of `SptNative` are safe code. `spt_verify_database` — the only export that
+runs fallible work — wraps it in `catch_unwind` and maps a panic to a status code; the other two
+cannot panic, and `extern "C"` aborts rather than unwinding regardless, so a Rust panic can never
+unwind into the CLR.
 `DatabaseImporter.LoadDatabaseAsync` calls `SptNative.EnsureLoadable()` on every startup — including
 DEBUG builds that skip verification — so a missing or ABI-mismatched library fails fast at startup
 rather than at first use.
