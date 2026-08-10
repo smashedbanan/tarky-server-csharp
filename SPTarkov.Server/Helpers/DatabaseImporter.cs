@@ -1,64 +1,24 @@
 using System.Diagnostics;
-using System.Security.Cryptography;
-using System.Text;
 using SPTarkov.Common.Models.Logging;
 using SPTarkov.Server.Core.Exceptions.Database;
+using SPTarkov.Server.Core.Native;
 using SPTarkov.Server.Core.Services.Locales;
 using SPTarkov.Server.Core.Utils;
-using Path = System.IO.Path;
 
 namespace SPTarkov.Server.Helpers;
 
 public sealed class DatabaseImporter(
     ISptLogger<DatabaseImporter> logger,
     ServerLocalisationService serverLocalisationService,
-    ImporterUtil importerUtil,
-    JsonUtil jsonUtil
+    ImporterUtil importerUtil
 )
 {
     private const string SptDataPath = "./SPT_Data/";
-    private readonly Dictionary<string, string> _databaseHashes = [];
-
-    public async Task LoadHashesAsync(CancellationToken cancellationToken = default)
-    {
-        var checksFilePath = Path.Combine(SptDataPath, "checks.dat");
-
-        try
-        {
-            if (File.Exists(checksFilePath))
-            {
-                await using var fs = File.OpenRead(checksFilePath);
-
-                using var reader = new StreamReader(fs, Encoding.ASCII);
-                var base64Content = await reader.ReadToEndAsync(cancellationToken);
-
-                var jsonBytes = Convert.FromBase64String(base64Content);
-
-                await using var ms = new MemoryStream(jsonBytes);
-
-                var FileHashes = await jsonUtil.DeserializeFromMemoryStreamAsync<List<FileHash>>(ms, cancellationToken) ?? [];
-
-                foreach (var hash in FileHashes)
-                {
-                    _databaseHashes.Add(hash.Path, hash.Hash);
-                }
-            }
-            else
-            {
-                logger.Error(serverLocalisationService.GetText("validation_error_exception", checksFilePath));
-            }
-        }
-        catch (Exception)
-        {
-            logger.Error(serverLocalisationService.GetText("validation_error_exception", checksFilePath));
-        }
-    }
 
     /// <summary>
     /// Read all json files in database folder and map into a json object
     /// </summary>
-    /// <param name="filePath">path to database folder</param>
-    /// <param name="shouldVerifyDatabase">if the database should be verified after deserialization</param>
+    /// <param name="shouldVerifyDatabase">if the database should be verified before deserialization</param>
     /// <param name="cancellationToken">
     /// The <see cref="CancellationToken"/> that can be used to cancel the database hydration operation.
     /// </param>
@@ -67,13 +27,17 @@ public sealed class DatabaseImporter(
     {
         try
         {
+            if (shouldVerifyDatabase)
+            {
+                await VerifyDatabaseAsync(cancellationToken);
+            }
+
             logger.Info(serverLocalisationService.GetText("importing_database"));
             Stopwatch timer = new();
             timer.Start();
 
             var dataToImport = await importerUtil.LoadRecursiveAsync<DatabaseTables>(
                 $"{SptDataPath}database/",
-                shouldVerifyDatabase ? VerifyDatabaseAsync : null,
                 cancellationToken: cancellationToken
             );
 
@@ -92,24 +56,26 @@ public sealed class DatabaseImporter(
         }
     }
 
-    public async Task VerifyDatabaseAsync(string fileName, CancellationToken cancellationToken)
+    private async Task VerifyDatabaseAsync(CancellationToken cancellationToken)
     {
-        var relativePath = fileName.StartsWith(SptDataPath, StringComparison.OrdinalIgnoreCase) ? fileName[SptDataPath.Length..] : fileName;
+        Stopwatch timer = new();
+        timer.Start();
 
-        using var md5 = MD5.Create();
-        await using var stream = File.OpenRead(fileName);
-        var hashBytes = await md5.ComputeHashAsync(stream, cancellationToken);
-        var hashString = Convert.ToHexString(hashBytes);
+        var result = await SptNative.VerifyDatabaseAsync(SptDataPath, cancellationToken);
 
-        if (!_databaseHashes.TryGetValue(relativePath, out var expectedHash) || expectedHash != hashString)
+        timer.Stop();
+        logger.Debug($"Database verification of {result.Checked} files took {timer.ElapsedMilliseconds}ms");
+
+        if (result.Ok)
         {
-            throw new ValidationErrorException(serverLocalisationService.GetText("validation_error_file", fileName));
+            return;
         }
-    }
 
-    private class FileHash
-    {
-        public string Path { get; set; } = string.Empty;
-        public string Hash { get; set; } = string.Empty;
+        foreach (var failure in result.Failures)
+        {
+            logger.Error(serverLocalisationService.GetText("validation_error_file", $"{failure.Path} ({failure.Reason})"));
+        }
+
+        throw new ValidationErrorException(serverLocalisationService.GetText("validation_error_file", result.Failures[0].Path));
     }
 }

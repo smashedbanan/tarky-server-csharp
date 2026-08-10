@@ -197,10 +197,6 @@ public static class Program
         var dbImporter = earlyServiceProvider.GetRequiredService<DatabaseImporter>();
 
         var shouldVerify = !ProgramStatics.DEBUG();
-        if (shouldVerify)
-        {
-            await dbImporter.LoadHashesAsync(cancellationToken);
-        }
 
         var tables =
             await dbImporter.LoadDatabaseAsync(shouldVerify, cancellationToken)
