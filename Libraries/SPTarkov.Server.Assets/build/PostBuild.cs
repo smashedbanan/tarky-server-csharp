@@ -1,5 +1,7 @@
+#:package System.IO.Hashing@10.0.10
+
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
+using System.IO.Hashing;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
@@ -40,17 +42,14 @@ async Task GenerateHashesAsync()
                 return;
             }
 
-            byte[] hashBytes;
+            var hasher = new XxHash128();
 
-            using (var md5 = MD5.Create())
+            await using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 8192, useAsync: true))
             {
-                await using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 8192, useAsync: true))
-                {
-                    hashBytes = await md5.ComputeHashAsync(stream, token);
-                }
+                await hasher.AppendAsync(stream, token);
             }
 
-            var hashString = BitConverter.ToString(hashBytes).Replace("-", "");
+            var hashString = Convert.ToHexString(hasher.GetCurrentHash());
             var relativePath = file.Substring(sptDataPath.Length + 1).Replace('\\', '/');
 
             hashes.Add(new FileHash { Path = relativePath, Hash = hashString });
