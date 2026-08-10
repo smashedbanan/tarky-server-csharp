@@ -200,8 +200,7 @@ compiling, so **`cargo` on `PATH` is a hard build dependency** — no rustup, no
 copied to every referencing project's output. Cross-RID builds must pass `-p:SptNativeRid=<rid>`
 (`dotnet publish -r` alone does not reach a RID-agnostic project reference); `Build.props` maps that
 to a Rust target triple, and `SPTarkov.Server.csproj` errors out for RIDs with no mapping instead of
-shipping a wrong-triple library. Cross-compiling also needs `rustup target add <triple>` and a cross
-linker (the `Dockerfile` installs the aarch64 one).
+shipping a wrong-triple library. Only `linux-x64` is mapped — arm64 is not a supported target.
 
 **Rule for future ports.** A static wrapper like `SptNative` is acceptable only for startup-internal
 subsystems that mods never touch. Anything mods can override or patch — loose-loot, bot and ragfair

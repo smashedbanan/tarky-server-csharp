@@ -24,11 +24,8 @@
   <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'win-x64'">
     <ApplicationIcon>..\Libraries\SPTarkov.Server.Assets\SPT_Data\images\icon.ico</ApplicationIcon>
   </PropertyGroup>
-  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' Or '$(RuntimeIdentifier)' == 'linux-arm64'">
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64'">
     <AssemblyName>SPT.Server.Linux</AssemblyName>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">
-    <AssemblyName>SPT.Server.Mac</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Libraries\SPTarkov.Reflection\SPTarkov.Reflection.csproj" />

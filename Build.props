@@ -27,6 +27,5 @@
     -->
     <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
         <SptNativeTargetTriple Condition="'$(SptNativeRid)' == 'linux-x64'">x86_64-unknown-linux-gnu</SptNativeTargetTriple>
-        <SptNativeTargetTriple Condition="'$(SptNativeRid)' == 'linux-arm64'">aarch64-unknown-linux-gnu</SptNativeTargetTriple>
     </PropertyGroup>
 </Project>

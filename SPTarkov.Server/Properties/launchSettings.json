@@ -9,11 +9,6 @@
       "commandName": "Project",
       "hotReloadEnabled": false,
       "workingDirectory": "bin/$(Configuration)/$(TargetFramework)"
-    },
-    "Spt Server (Mac)": {
-      "commandName": "Project",
-      "hotReloadEnabled": false,
-      "workingDirectory": "bin/$(Configuration)/$(TargetFramework)/osx-arm64"
     }
   }
 }

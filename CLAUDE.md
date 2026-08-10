@@ -27,10 +27,8 @@ Publish flags (`dotnet publish`) feed the generated `ProgramStatics` class: `-p:
 first, and a missing toolchain fails the build with `MSB3073`. Publishing for a RID other than the build host's needs
 `-p:SptNativeRid=<rid>` as well (`dotnet publish -r` alone never reaches a RID-agnostic project reference, so cargo
 would silently emit a host-triple library); `Build.props` maps the RID to a Rust target triple and
-`SPTarkov.Server.csproj` errors out for unmapped RIDs. Only same-OS targets are mapped — currently `linux-x64` and
-`linux-arm64` on Linux hosts — and cross-compiling additionally needs `rustup target add <triple>` plus a cross linker
-(`gcc-aarch64-linux-gnu` + `libc6-dev-arm64-cross` for arm64; the `Dockerfile` installs both). Cross-arch *images* still
-need an arm64 builder or qemu binfmt for the runtime stage.
+`SPTarkov.Server.csproj` errors out for unmapped RIDs. Only `linux-x64` on Linux hosts is mapped — arm64 is not a
+supported target for this fork, and Docker builds accept only `TARGETARCH=amd64`.
 
 Release builds also regenerate `SPT_Data/checks.dat` by running `Libraries/SPTarkov.Server.Assets/build/PostBuild.cs`,
 which pulls `System.IO.Hashing` from NuGet — a Release build on a machine with an empty NuGet cache needs network
