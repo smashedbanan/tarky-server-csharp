@@ -14,14 +14,22 @@ ARG SptBuildType=RELEASE
 WORKDIR /src
 
 # dotnet publish invokes cargo for rust/spt-native; the SDK image has no C linker for it.
+# gcc-aarch64-linux-gnu links the arm64 target from an amd64 builder; the reverse (arm64 builder,
+# --platform linux/amd64) would additionally need gcc-x86-64-linux-gnu and that rustup target.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && apt-get install -y --no-install-recommends gcc libc6-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal \
+    --component rustfmt,clippy
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+RUN rustup target add aarch64-unknown-linux-gnu
 
 COPY . .
 
+# -p:SptNativeRid makes cargo cross-compile spt_native for the target RID; --runtime alone does not
+# reach the RID-agnostic project reference that owns the cargo build (see Build.props).
+# Building a foreign-arch image also needs a builder of that arch or qemu binfmt for the runtime stage.
 RUN case "${TARGETARCH}" in \
         amd64) RID=linux-x64 ;; \
         arm64) RID=linux-arm64 ;; \
@@ -30,6 +38,7 @@ RUN case "${TARGETARCH}" in \
     && dotnet publish SPTarkov.Server/SPTarkov.Server.csproj \
     --configuration Release \
     --runtime "${RID}" \
+    -p:SptNativeRid="${RID}" \
     --self-contained false \
     -p:SptVersion="${SptVersion}" \
     -p:SptCommit="${SptCommit}" \

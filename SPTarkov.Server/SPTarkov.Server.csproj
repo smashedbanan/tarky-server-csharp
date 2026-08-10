@@ -57,11 +57,15 @@
   <ItemGroup>
     <None Include="..\LICENSE" Pack="true" Visible="false" PackagePath="" />
   </ItemGroup>
-  <!-- cargo only ever emits a host-triple artifact, so a foreign-RID publish would package the wrong spt_native. -->
+  <!-- Without a Rust target for the RID, cargo emits a host-triple artifact and the publish would package the wrong spt_native. -->
   <Target Name="CheckSptNativeRuntimeIdentifier" BeforeTargets="Build;Publish">
     <Error
-      Condition="'$(RuntimeIdentifier)' != '' And '$(RuntimeIdentifier)' != '$(NETCoreSdkPortableRuntimeIdentifier)'"
-      Text="Cross-RID publish is not supported: spt_native is built for the build host's triple ($(NETCoreSdkPortableRuntimeIdentifier)) only. Publish on a matching host."
+      Condition="'$(RuntimeIdentifier)' != '' And '$(RuntimeIdentifier)' != '$(NETCoreSdkPortableRuntimeIdentifier)' And '$(SptNativeTargetTriple)' == ''"
+      Text="Cross-RID publish to $(RuntimeIdentifier) is not supported from a $(NETCoreSdkPortableRuntimeIdentifier) host: no Rust target is mapped for it, so spt_native would be built for the host's triple. Pass -p:SptNativeRid=$(RuntimeIdentifier) if Build.props maps that RID, otherwise publish on a matching host."
+    />
+    <Error
+      Condition="'$(SptNativeRid)' != '' And '$(SptNativeRid)' != '$(RuntimeIdentifier)'"
+      Text="SptNativeRid ($(SptNativeRid)) does not match RuntimeIdentifier ($(RuntimeIdentifier)): spt_native would be cross-compiled for a different platform than the publish output."
     />
   </Target>
   <Target Name="RelocateSatelliteAssemblies" AfterTargets="ResolveAssemblyReferences">

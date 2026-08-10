@@ -17,4 +17,16 @@
         <RepositoryType>Git</RepositoryType>
         <CETCompat>false</CETCompat>
     </PropertyGroup>
+    <!--
+      rust/spt-native cross-compilation. `dotnet publish -r <rid>` does not flow RuntimeIdentifier to
+      RID-agnostic project references, so a cross-RID build must name the target RID explicitly with
+      -p:SptNativeRid=<rid>. Unset means "build for the build host's triple" - the normal path.
+      Only same-OS targets are mapped; a foreign-OS triple needs that OS's linker/SDK. Building one
+      also needs `rustup target add <triple>` and a matching cross linker on PATH (see Dockerfile).
+      Consumed by BuildSptNative in SPTarkov.Server.Core.csproj and the guard in SPTarkov.Server.csproj.
+    -->
+    <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Linux'))">
+        <SptNativeTargetTriple Condition="'$(SptNativeRid)' == 'linux-x64'">x86_64-unknown-linux-gnu</SptNativeTargetTriple>
+        <SptNativeTargetTriple Condition="'$(SptNativeRid)' == 'linux-arm64'">aarch64-unknown-linux-gnu</SptNativeTargetTriple>
+    </PropertyGroup>
 </Project>
