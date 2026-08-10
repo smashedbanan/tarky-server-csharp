@@ -1,3 +1,5 @@
+pub mod verify;
+
 pub const ABI_VERSION: u32 = 1;
 
 #[cfg(test)]
