@@ -1,3 +1,4 @@
+pub mod ffi;
 pub mod runtime;
 pub mod verify;
 
