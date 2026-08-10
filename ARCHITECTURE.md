@@ -14,6 +14,7 @@ How the SPT server is put together. For build/run commands and contribution rule
 | `Libraries/SPTarkov.DI` | Attribute-driven DI container: `[Injectable]`, `DependencyInjectionHandler` |
 | `Libraries/SPTarkov.Common` | Shared primitives and logging (`SptLogger`, log handlers) |
 | `Libraries/SPTarkov.Reflection` | Runtime method patching for mods (`AbstractPatch`, `PatchManager`) |
+| `rust/` | Cargo workspace: the `spt-native` cdylib called over C ABI (see Native Rust layer) |
 | `Tools/Ceciler` | Mono.Cecil IL rewriter run on Release builds (see Build-time code generation) |
 | `Tools/MongoIdTplGenerator`, `Tools/JsonExtensionDataGenerator`, `Tools/HideoutCraftQuestIdGenerator` | Dev-time one-shot generators |
 | `Testing/UnitTests` | NUnit suite | 
@@ -162,3 +163,44 @@ Two non-obvious steps run during build, both in `SPTarkov.Server.Core.csproj`:
 
 `SPTarkov.Server.Assets` hashes `SPT_Data` into `checks.dat` on Release builds, which
 `DatabaseImporter` verifies at startup outside DEBUG.
+
+## Native Rust layer
+
+`rust/` is a Cargo workspace with one crate, `spt-native`, built as a `cdylib`. Today it owns exactly
+one job: hashing `SPT_Data` with XXH3-128 and comparing it against `checks.dat`, in parallel on a
+process-wide tokio runtime (`runtime.rs`), replacing the per-file MD5 loop that used to run inside
+the import.
+
+Three C-ABI exports (`src/ffi.rs`), consumed by `Libraries/SPTarkov.Server.Core/Native/`:
+
+| Export | Purpose |
+|---|---|
+| `spt_native_abi_version` | `u32` handshake; must equal `SptNative.ExpectedAbiVersion` |
+| `spt_verify_database` | Hashes the tree, returns a heap-allocated JSON `VerifyReport` |
+| `spt_buf_free` | Releases that buffer |
+
+`unsafe` is confined to `ffi.rs` (raw pointer in/out) and `NativeMethods.cs` (`DllImport` +
+`fixed`); `verify.rs`, `runtime.rs` and the C# `SptNative` wrapper are safe code. Every export
+catches panics and maps them to a status code, so a Rust panic can never unwind into the CLR.
+`DatabaseImporter.LoadDatabaseAsync` calls `SptNative.EnsureLoadable()` on every startup — including
+DEBUG builds that skip verification — so a missing or ABI-mismatched library fails fast at startup
+rather than at first use.
+
+The hash contract is shared with `Libraries/SPTarkov.Server.Assets/build/PostBuild.cs`, which writes
+`checks.dat` as base64 JSON of `{Path, Hash}` pairs with `System.IO.Hashing.XxHash128` — canonical
+big-endian hex, matching Rust's `xxh3_128` formatting. The verified set must also stay in sync with
+`ImporterUtil`'s ignore lists (reciprocal comments mark both sides).
+
+Build coupling: `BuildSptNative` in `SPTarkov.Server.Core.csproj` shells out to `cargo build` before
+compiling, so **`cargo` on `PATH` is a hard build dependency** — no rustup, no build. The artifact is
+copied to every referencing project's output. Cross-RID builds must pass `-p:SptNativeRid=<rid>`
+(`dotnet publish -r` alone does not reach a RID-agnostic project reference); `Build.props` maps that
+to a Rust target triple, and `SPTarkov.Server.csproj` errors out for RIDs with no mapping instead of
+shipping a wrong-triple library. Cross-compiling also needs `rustup target add <triple>` and a cross
+linker (the `Dockerfile` installs the aarch64 one).
+
+**Rule for future ports.** A static wrapper like `SptNative` is acceptable only for startup-internal
+subsystems that mods never touch. Anything mods can override or patch — loose-loot, bot and ragfair
+generation are the intended next ports — must stay an `[Injectable]` service behind an interface,
+resolved through DI and overridable by `TypePriority`, with the Rust call made from inside it. A
+static class cannot be overridden, mocked, or patched by `SPTarkov.Reflection`.
