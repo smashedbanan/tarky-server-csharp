@@ -101,10 +101,6 @@ public class SptNativeVerifyTests
             })
             .ToList();
         var json = JsonSerializer.Serialize(entries);
-        File.WriteAllText(
-            Path.Combine(_sptDataDir, "checks.dat"),
-            Convert.ToBase64String(Encoding.UTF8.GetBytes(json)),
-            Encoding.ASCII
-        );
+        File.WriteAllText(Path.Combine(_sptDataDir, "checks.dat"), Convert.ToBase64String(Encoding.UTF8.GetBytes(json)), Encoding.ASCII);
     }
 }

@@ -61,8 +61,10 @@
     <SptNativeLibName Condition="'$(SptNativeLibName)' == ''">libspt_native.so</SptNativeLibName>
     <!-- $(SptNativeTargetTriple) is set (Build.props) only for a cross-RID build; cargo then writes to target/<triple>/. -->
     <CargoTargetFlag Condition="'$(SptNativeTargetTriple)' != ''">--target $(SptNativeTargetTriple)</CargoTargetFlag>
-    <SptNativeLibPath Condition="'$(SptNativeTargetTriple)' == ''">$(SptNativeDir)/target/$(CargoProfile)/$(SptNativeLibName)</SptNativeLibPath>
-    <SptNativeLibPath Condition="'$(SptNativeTargetTriple)' != ''">$(SptNativeDir)/target/$(SptNativeTargetTriple)/$(CargoProfile)/$(SptNativeLibName)</SptNativeLibPath>
+    <SptNativeLibPath Condition="'$(SptNativeTargetTriple)' == ''"
+      >$(SptNativeDir)/target/$(CargoProfile)/$(SptNativeLibName)</SptNativeLibPath>
+    <SptNativeLibPath Condition="'$(SptNativeTargetTriple)' != ''"
+      >$(SptNativeDir)/target/$(SptNativeTargetTriple)/$(CargoProfile)/$(SptNativeLibName)</SptNativeLibPath>
   </PropertyGroup>
   <Target Name="BuildSptNative" BeforeTargets="AssignTargetPaths">
     <Exec Command="cargo build $(CargoProfileFlag) $(CargoTargetFlag)" WorkingDirectory="$(SptNativeDir)" ConsoleToMsBuild="true" />
