@@ -1,5 +1,3 @@
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sp-tarkov/server-csharp)
-
 # Single Player Tarkov - Server Project
 
 This is the Server project for the Single Player Tarkov mod for Escape From Tarkov. It can be run locally to replicate responses to the modified Escape From Tarkov client.
@@ -19,7 +17,6 @@ This is the Server project for the Single Player Tarkov mod for Escape From Tark
 - [Contributing](#contributing)
   - [Branches](#branchs)
   - [Pull Request Guidelines](#pull-request-guidelines)
-  - [Git LFS](#git-large-file-storage-lfs)
   - [Style Guide](#style-guide)
   - [Tests](#tests)
 - [License](#license)
@@ -84,10 +81,10 @@ We're really excited that you're interested in contributing! Before submitting y
 
 - **master**
   The default branch used for the latest stable release. This branch is protected and typically is only merged with release branches.
-- **develop (4.0x)**
-  The 4.0 branch for server development. **There is no more work being done on 4.0 at the moment, this branch should not be targeted!**
-- **4.1x-dev**
+- **4.1.x-dev**
   The 4.1 branch for server development. **PRs should target this.**
+- **4.0.13-legacy**
+  The 4.0.13-legacy branch is an archive. **PRs will be denied.**
 
 ### Pull Request Guidelines
 
@@ -101,10 +98,6 @@ We're really excited that you're interested in contributing! Before submitting y
   When creating a PR, make sure the title is meaningful and describes the changes you've made.
 - **Write Detailed Commit Messages**
   Bring out your table manners, speak the Queen's English and be on your best behaviour.
-
-### Git Large File Storage (LFS)
-
-We use a custom git LFS server to store large files. The public server is read-only. If you are adding or modifying large files, you will need to create an issue with details about this change so that a project developer can make them to a writable endpoint of the LFS server. Bonus points if you include a patch file in the issue. **You will not be able to submit a pull request for LFS file changes.**
 
 ### Style Guide
 
@@ -125,11 +118,7 @@ In Rider, after installing the CSharpier plugin:
     - Check `Reformat and Cleanup Code`
     - Set to `Reformat & Apply Syntax Style`, `Changed lines`
 
-### Tests
-
-We have a number of tests that are run automatically when you submit a pull request. You can run these tests locally by running The unit test sub-project. If you're adding a new feature or fixing a bug, please consider adding tests to cover your changes so that we can ensure they don't break in the future.
-
 
 ## License
 
-This project is licensed under the NCSA Open Source License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International Open Source License. See the [LICENSE](LICENSE) file for details.

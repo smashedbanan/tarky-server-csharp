@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-git lfs pull                                        # REQUIRED before first build - SPT_Data lives in LFS
+scripts/decompress-assets.sh                        # REQUIRED before first build (or .ps1 on Windows) - unpacks looseLoot.7z
 dotnet build                                        # solution is server-csharp.slnx (README's .sln path is stale)
 dotnet test                                         # all tests (Testing/UnitTests, NUnit)
 dotnet test --filter "FullyQualifiedName~MongoIdTests"   # single fixture
@@ -25,13 +25,17 @@ This fork has no CI: `.github/` (workflows, CODEOWNERS, issue templates, funding
 tests, and build checks are local-only — nothing enforces them on push. Upstream formats JSON under `SPT_Data` with
 Biome; there is no committed `biome.json` to reproduce that locally.
 
-LFS files cannot be changed via PR upstream — open an issue instead.
+Upstream stores its large database JSON files (`looseLoot.json`, `items.json`) via a custom LFS server and rejects PRs
+that touch them — open an issue instead. This fork instead bundles those files as a plain 7z archive
+(`Libraries/SPTarkov.Server.Assets/looseLoot.7z`, extracted by `scripts/decompress-assets.sh`/`.ps1`), so no LFS
+setup is needed here and normal PRs touching them are fine.
 
 ## Architecture
 
 Five projects matter: `SPTarkov.Server` (host/entry point + mod loading), `Libraries/SPTarkov.Server.Core` (all game
 logic), `Libraries/SPTarkov.Server.Web` (Blazor admin panel), `Libraries/SPTarkov.DI` (the attribute-driven container),
-`Libraries/SPTarkov.Server.Assets` (SPT_Data: configs, JSON database, images — LFS-backed).
+`Libraries/SPTarkov.Server.Assets` (SPT_Data: configs, JSON database, images; the largest JSON files ship as
+`looseLoot.7z`, see Commands above).
 
 ### Request pipeline
 
