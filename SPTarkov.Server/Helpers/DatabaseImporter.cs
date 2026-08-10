@@ -27,6 +27,10 @@ public sealed class DatabaseImporter(
     {
         try
         {
+            // Even builds that skip verification depend on spt_native, so probe it here rather than
+            // letting a missing or stale library surface as a DllNotFoundException mid-request.
+            SptNative.EnsureLoadable();
+
             if (shouldVerifyDatabase)
             {
                 await VerifyDatabaseAsync(cancellationToken);
@@ -76,6 +80,8 @@ public sealed class DatabaseImporter(
             logger.Error(serverLocalisationService.GetText("validation_error_file", $"{failure.Path} ({failure.Reason})"));
         }
 
-        throw new ValidationErrorException(serverLocalisationService.GetText("validation_error_file", result.Failures[0].Path));
+        var firstFailure = result.Failures.FirstOrDefault()?.Path ?? "unknown (spt_native reported a failure with no details)";
+
+        throw new ValidationErrorException(serverLocalisationService.GetText("validation_error_file", firstFailure));
     }
 }

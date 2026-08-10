@@ -29,8 +29,12 @@ public class SptNativeVerifyTests
     {
         WriteDatabaseFile("database/globals.json", """{"a":1}""");
         WriteDatabaseFile("database/templates/items.json", """{"b":2}""");
+        // Every ImporterUtil exclusion the native verifier mirrors, so a drift on either side fails here.
         WriteDatabaseFile("database/locales/server/en.json", """{"ignored":true}""");
+        WriteDatabaseFile("database/locales/web/en.json", """{"ignored":true}""");
         WriteDatabaseFile("database/bearsuits.json", """{"ignored":true}""");
+        WriteDatabaseFile("database/usecsuits.json", """{"ignored":true}""");
+        WriteDatabaseFile("database/archivedquests.json", """{"ignored":true}""");
         WriteChecksDat("database/globals.json", "database/templates/items.json");
 
         var result = await SptNative.VerifyDatabaseAsync(_sptDataDir);

@@ -34,9 +34,24 @@ public static class SptNative
         return Task.Run(() => VerifyDatabase(sptDataDir), cancellationToken);
     }
 
+    /// <summary>
+    /// Forces the native library to load and checks its ABI version, so a missing or stale
+    /// spt_native fails at startup with a clear message instead of mid-request.
+    /// </summary>
+    public static void EnsureLoadable()
+    {
+        var actual = NativeMethods.AbiVersion();
+        if (actual != ExpectedAbiVersion)
+        {
+            throw new InvalidOperationException(
+                $"spt_native ABI version mismatch: expected {ExpectedAbiVersion}, found {actual}. Rebuild the native library (dotnet build runs cargo automatically)."
+            );
+        }
+    }
+
     private static unsafe VerifyResult VerifyDatabase(string sptDataDir)
     {
-        EnsureAbiVersion();
+        EnsureLoadable();
 
         var dirUtf8 = Encoding.UTF8.GetBytes(sptDataDir);
         byte* outPtr = null;
@@ -64,17 +79,6 @@ public static class SptNative
         finally
         {
             NativeMethods.BufFree(outPtr, outLen);
-        }
-    }
-
-    private static void EnsureAbiVersion()
-    {
-        var actual = NativeMethods.AbiVersion();
-        if (actual != ExpectedAbiVersion)
-        {
-            throw new InvalidOperationException(
-                $"spt_native ABI version mismatch: expected {ExpectedAbiVersion}, found {actual}. Rebuild the native library (dotnet build runs cargo automatically)."
-            );
         }
     }
 }

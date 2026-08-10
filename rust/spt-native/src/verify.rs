@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct ManifestEntry {
@@ -23,6 +23,9 @@ pub fn parse_manifest(raw: &[u8]) -> Result<HashMap<String, String>, String> {
     Ok(entries.into_iter().map(|e| (e.path, e.hash)).collect())
 }
 
+// Keep in sync with `_filesToIgnore`/`_directoriesToIgnore` in
+// Libraries/SPTarkov.Server.Core/Utils/ImporterUtil.cs: a file the importer loads but this list
+// skips is imported without ever being tamper-checked.
 const IGNORED_FILE_NAMES: [&str; 3] = ["bearsuits.json", "usecsuits.json", "archivedquests.json"];
 const IGNORED_DIR_KEYS: [&str; 2] = ["database/locales/server", "database/locales/web"];
 
@@ -67,8 +70,6 @@ pub fn collect_files(spt_data: &Path) -> Vec<(PathBuf, String)> {
     files
 }
 
-use serde::Serialize;
-
 #[derive(Serialize)]
 pub struct VerifyReport {
     pub ok: bool,
@@ -85,7 +86,6 @@ pub struct Failure {
 const MAX_CONCURRENT_HASHES: usize = 32;
 
 pub async fn verify(spt_data: PathBuf) -> VerifyReport {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     let manifest_path = spt_data.join("checks.dat");
@@ -285,6 +285,20 @@ mod tests {
             keys(dir.path()),
             vec!["database/locales/global/en.json".to_string()]
         );
+    }
+
+    #[test]
+    fn ignored_dir_rule_is_an_exact_path_match_not_a_name_match() {
+        let dir = TempDir::new().unwrap();
+        touch(dir.path(), "database/locales/server/en.json");
+        touch(dir.path(), "database/other/server/x.json");
+        touch(dir.path(), "database/server.json");
+        let mut expected = vec![
+            "database/other/server/x.json".to_string(),
+            "database/server.json".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(keys(dir.path()), expected);
     }
 
     #[test]

@@ -13,6 +13,8 @@ namespace SPTarkov.Server.Core.Utils;
 [Injectable(InjectionType.Singleton)]
 public sealed class ImporterUtil(ISptLogger<ImporterUtil> logger, FileUtil fileUtil, JsonUtil jsonUtil)
 {
+    // Keep in sync with IGNORED_DIR_KEYS/IGNORED_FILE_NAMES in rust/spt-native/src/verify.rs: anything
+    // dropped from these sets becomes a file the importer loads but the native verifier never hashes.
     private readonly FrozenSet<string> _directoriesToIgnore = ["./SPT_Data/database/locales/server", "./SPT_Data/database/locales/web"];
     private readonly FrozenSet<string> _filesToIgnore = ["bearsuits.json", "usecsuits.json", "archivedquests.json"];
 
