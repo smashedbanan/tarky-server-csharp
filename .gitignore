@@ -516,3 +516,4 @@ Testing/**/Properties/launchSettings.json
 .superpowers/
 docs/
 graphify-out/
+rust/target/
