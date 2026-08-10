@@ -1,6 +1,7 @@
 # Build Outputs
 **/bin/
 **/obj/
+rust/target/
 
 # VCS/IDE/CI metadata
 .git/

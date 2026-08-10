@@ -12,6 +12,14 @@ ARG SptBuildTime=0000000000
 ARG SptBuildType=RELEASE
 
 WORKDIR /src
+
+# dotnet publish invokes cargo for rust/spt-native; the SDK image has no C linker for it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1 --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 COPY . .
 
 RUN case "${TARGETARCH}" in \

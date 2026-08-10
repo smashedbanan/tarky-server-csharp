@@ -6,11 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 scripts/decompress-assets.sh                        # REQUIRED before first build (or .ps1 on Windows) - unpacks looseLoot.7z
+# rustup (Rust 1.97.1) is REQUIRED: dotnet build invokes cargo for rust/spt-native
 dotnet build                                        # solution is server-csharp.slnx (README's .sln path is stale)
 dotnet test                                         # all tests (Testing/UnitTests, NUnit)
 dotnet test --filter "FullyQualifiedName~MongoIdTests"   # single fixture
 dotnet test --filter "Name=EveryRegisteredServiceCanBeResolved"   # single test
 csharpier format .                                  # run before opening a PR
+cd rust && cargo test && cargo fmt --check && cargo clippy --all-targets -- -D warnings   # Rust checks
 ```
 
 The server refuses to start unless the working directory contains `sptLogger.json`/`sptLogger.Development.json`, so run
@@ -20,6 +22,14 @@ the built `SPT.Server` executable from its output directory (`SPTarkov.Server/bi
 Publish flags (`dotnet publish`) feed the generated `ProgramStatics` class: `-p:SptVersion=`, `-p:SptCommit=`,
 `-p:SptBuildTime=`, `-p:SptBuildType=` (`LOCAL`/`DEBUG`/`RELEASE`/`BLEEDINGEDGE`/`BLEEDINGEDGEMODS`). Defaults live in
 `Build.props`.
+
+`cargo` must be on `PATH` for **any** `dotnet build` of the solution — `SPTarkov.Server.Core` builds `rust/spt-native`
+first, and a missing toolchain fails the build with `MSB3073`. Publishing for a RID other than the build host's is
+rejected up front: the native library is built for the host triple only.
+
+Release builds also regenerate `SPT_Data/checks.dat` by running `Libraries/SPTarkov.Server.Assets/build/PostBuild.cs`,
+which pulls `System.IO.Hashing` from NuGet — a Release build on a machine with an empty NuGet cache needs network
+access.
 
 This fork has no CI: `.github/` (workflows, CODEOWNERS, issue templates, funding config) was removed. Formatting,
 tests, and build checks are local-only — nothing enforces them on push. Upstream formats JSON under `SPT_Data` with

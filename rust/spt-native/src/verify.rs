@@ -379,4 +379,16 @@ mod tests {
         assert_eq!(report.failures[0].path, "database");
         assert_eq!(report.failures[0].reason, "no verifiable files found");
     }
+
+    #[tokio::test]
+    async fn multi_chunk_file_hashes_identically_to_one_shot() {
+        // xxh3_file streams in 64 KiB chunks; the generator and test helpers hash one-shot.
+        let dir = TempDir::new().unwrap();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let path = dir.path().join("database/big.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &big).unwrap();
+
+        assert_eq!(xxh3_file(&path).await.unwrap(), xxh3_hex(&big));
+    }
 }

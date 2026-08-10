@@ -35,6 +35,9 @@ One of the following is required:
 - Minimum Visual Studio version required: `17.13.5`
 - Minimum Rider version required: `2024.3`
 
+Also required:
+- Rust toolchain via [rustup](https://rustup.rs) — the build runs `cargo` automatically for the native library (`rust/`, pinned to 1.97.1 by `rust-toolchain.toml`).
+
 ### Initial Setup
 
 1. Download and install the [.net 10.0 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0).

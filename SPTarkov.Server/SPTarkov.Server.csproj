@@ -57,6 +57,13 @@
   <ItemGroup>
     <None Include="..\LICENSE" Pack="true" Visible="false" PackagePath="" />
   </ItemGroup>
+  <!-- cargo only ever emits a host-triple artifact, so a foreign-RID publish would package the wrong spt_native. -->
+  <Target Name="CheckSptNativeRuntimeIdentifier" BeforeTargets="Build;Publish">
+    <Error
+      Condition="'$(RuntimeIdentifier)' != '' And '$(RuntimeIdentifier)' != '$(NETCoreSdkPortableRuntimeIdentifier)'"
+      Text="Cross-RID publish is not supported: spt_native is built for the build host's triple ($(NETCoreSdkPortableRuntimeIdentifier)) only. Publish on a matching host."
+    />
+  </Target>
   <Target Name="RelocateSatelliteAssemblies" AfterTargets="ResolveAssemblyReferences">
     <ItemGroup>
       <_RelocatedSatelliteCulture
