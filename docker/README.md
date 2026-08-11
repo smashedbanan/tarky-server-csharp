@@ -58,7 +58,7 @@ Everything the server writes lives under `/opt/spt/user`, exposed as a volume:
 ## Building Locally
 
 ```bash
-git lfs pull # Make sure SPT_Data is pulled
+scripts/decompress-assets.sh # unpack the bundled SPT_Data files (this fork uses 7z, not Git LFS)
 docker build -t spt-server:local \
   --build-arg SptVersion=4.1.0 \
   --build-arg SptCommit=$(git rev-parse --short=7 HEAD) \
