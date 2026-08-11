@@ -23,14 +23,15 @@ type Extra = serde_json::Map<String, serde_json::Value>;
 // ---------------------------------------------------------------------------
 
 /// `Models/Eft/Common/Vector3.cs` — `float` members, so `f32` here keeps the serialized
-/// representation identical to C#'s.
+/// representation identical to C#'s. The `[JsonConstructor]` takes the three axes as plain
+/// (non-`required`) parameters, so C# substitutes `0` for any the JSON omits instead of throwing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Vector3 {
-    #[serde(rename = "x")]
+    #[serde(rename = "x", default)]
     pub x: f32,
-    #[serde(rename = "y")]
+    #[serde(rename = "y", default)]
     pub y: f32,
-    #[serde(rename = "z")]
+    #[serde(rename = "z", default)]
     pub z: f32,
     #[serde(flatten)]
     pub extra: Extra,
@@ -69,7 +70,8 @@ pub struct ItemLocation {
     pub x: Option<i32>,
     #[serde(rename = "y", skip_serializing_if = "Option::is_none")]
     pub y: Option<i32>,
-    #[serde(rename = "r")]
+    /// Non-`required` in C#, so a missing key lands on the zero value (`Horizontal`).
+    #[serde(rename = "r", default)]
     pub r: ItemRotation,
     #[serde(rename = "isSearched", skip_serializing_if = "Option::is_none")]
     pub is_searched: Option<bool>,
@@ -212,9 +214,11 @@ pub struct StaticContainerData {
 /// `Models/Eft/Common/Location.cs`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StaticForced {
-    #[serde(rename = "containerId")]
+    /// Plain non-`required` `string` in C# (`Location.cs:121`), so a null one is dropped on the way
+    /// out by `WhenWritingNull` and must not be a hard parse error on the way back in.
+    #[serde(rename = "containerId", default)]
     pub container_id: String,
-    #[serde(rename = "itemTpl")]
+    #[serde(rename = "itemTpl", default)]
     pub item_tpl: String,
     #[serde(flatten)]
     pub extra: Extra,
@@ -255,7 +259,8 @@ pub struct ItemCountDistribution {
 /// `Models/Eft/Common/Location.cs`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ItemDistribution {
-    #[serde(rename = "tpl")]
+    /// Non-`required` `MongoId` in C#, which defaults rather than throwing on a missing key.
+    #[serde(rename = "tpl", default)]
     pub tpl: String,
     #[serde(
         rename = "relativeProbability",
@@ -555,6 +560,36 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out, serde_json::json!({"x":1,"y":2,"r":"Vertical"}));
+    }
+
+    /// None of these members is `required` in C#, so a map or mod that omits one gets the type's
+    /// zero value there rather than taking down the whole request deserialize. A hard error would
+    /// surface to the operator as "native library bug" when it is really just sparse game data.
+    #[test]
+    fn non_required_members_default_instead_of_failing_the_parse() {
+        let vector: Vector3 = serde_json::from_str("{}").unwrap();
+        assert_eq!((vector.x, vector.y, vector.z), (0.0, 0.0, 0.0));
+
+        let partial: Vector3 = serde_json::from_str(r#"{"y":4.5}"#).unwrap();
+        assert_eq!((partial.x, partial.y, partial.z), (0.0, 4.5, 0.0));
+
+        let forced: StaticForced = serde_json::from_str("{}").unwrap();
+        assert_eq!(forced.container_id, "");
+        assert_eq!(forced.item_tpl, "");
+
+        let distribution: ItemDistribution = serde_json::from_str("{}").unwrap();
+        assert_eq!(distribution.tpl, "");
+        assert_eq!(distribution.relative_probability, None);
+
+        let location: ItemLocation = serde_json::from_str("{}").unwrap();
+        assert_eq!(location.r, ItemRotation::Horizontal);
+
+        // Both distributions are `Option`, which serde already fills with `None` on a missing key.
+        // `None` is the value the generator's warning branches look for, so it must stay `None`
+        // rather than becoming an empty `Vec` (see the note in the fix report).
+        let details: StaticLootDetails = serde_json::from_str("{}").unwrap();
+        assert!(details.item_count_distribution.is_none());
+        assert!(details.item_distribution.is_none());
     }
 
     #[test]
