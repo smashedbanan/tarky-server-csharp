@@ -443,10 +443,19 @@ pub struct DynamicLootRequest {
     pub loose_loot: LooseLoot,
 }
 
+/// Diagnostic levels, one per `logger` method the ported C# calls.
+pub const DEBUG: &str = "debug";
+/// See [`DEBUG`].
+pub const WARNING: &str = "warning";
+/// See [`DEBUG`].
+pub const ERROR: &str = "error";
+/// See [`DEBUG`].
+pub const SUCCESS: &str = "success";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
-    /// `"debug"` | `"warning"` | `"error"` | `"success"`.
+    /// One of [`DEBUG`], [`WARNING`], [`ERROR`], [`SUCCESS`].
     pub level: String,
     pub locale_key: Option<String>,
     /// Object; C# replays it via `ServerLocalisationService`.

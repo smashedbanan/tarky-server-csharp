@@ -4,8 +4,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::models::{
-    CounterState, Diagnostic, Item, ItemView, LootConfigView, PresetView, SeasonalView,
-    SptLootItem, StaticAmmoDetails, Upd,
+    CounterState, DEBUG, Diagnostic, ERROR, Item, ItemView, LootConfigView, PresetView,
+    SeasonalView, SptLootItem, StaticAmmoDetails, Upd, WARNING,
 };
 use super::probability_object_array::{ProbabilityObject, ProbabilityObjectArray};
 use super::{mongo_id, random_util};
@@ -294,11 +294,6 @@ pub fn to_loot_item(item: &Item) -> SptLootItem {
 // ---------------------------------------------------------------------------
 // Cartridge / magazine / child-slot assembly
 // ---------------------------------------------------------------------------
-
-/// Diagnostic levels, one per `logger` method the ported C# calls.
-const DEBUG: &str = "debug";
-const WARNING: &str = "warning";
-const ERROR: &str = "error";
 
 /// The read-only views a generation run consults, plus the two things it mutates as it goes: the
 /// spawn-limit counters and the diagnostics the C# caller replays through its logger.

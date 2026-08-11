@@ -1,5 +1,5 @@
-//! `Generators/Loot/LocationLootGenerator.cs:94-623,1025-1266` — the static-container half of the
-//! loot generator, ported method for method.
+//! `Generators/Loot/LocationLootGenerator.cs:94-1266` — the loot generator, ported method for
+//! method: static containers first, then the dynamic (loose) loot half.
 //!
 //! The C# logs through `ISptLogger` and localises through `ServerLocalisationService`; both come out
 //! of here as [`Diagnostic`]s for the caller to replay. Where the C# throws (or dereferences a null
@@ -15,18 +15,13 @@ use super::container_extensions::{
 };
 use super::item_helper::{self, LootContext, LootError};
 use super::models::{
-    CounterState, Diagnostic, Item, ItemLocation, ItemRotation, LootConfigView, SpawnpointTemplate,
-    StaticContainer, StaticContainerData, StaticContainersRequest, StaticContainersResult,
-    StaticForced, StaticLootDetails, Upd,
+    CounterState, DEBUG, Diagnostic, DynamicLootRequest, DynamicLootResult, ERROR, Item,
+    ItemLocation, ItemRotation, LootCommon, LootConfigView, SUCCESS, Spawnpoint,
+    SpawnpointTemplate, SptLootItem, StaticContainer, StaticContainerData, StaticContainersRequest,
+    StaticContainersResult, StaticForced, StaticLootDetails, Upd, WARNING,
 };
 use super::probability_object_array::{ProbabilityObject, ProbabilityObjectArray};
 use super::{mongo_id, random_util};
-
-/// Diagnostic levels, one per `logger` method the ported C# calls.
-const DEBUG: &str = "debug";
-const WARNING: &str = "warning";
-const ERROR: &str = "error";
-const SUCCESS: &str = "success";
 
 /// `LocationLootGenerator.cs:1269-1276`. C# types `ChosenCount` as `double?`; the empty group is
 /// seeded with -1 and every other value comes out of `GetInt`.
@@ -89,15 +84,15 @@ fn item_count(template: &SpawnpointTemplate) -> i32 {
 
 /// The read-only half of a request, lent to the run; `counter` moves in so the run can mutate it
 /// and the totals can be handed back to C#.
-fn loot_context(request: &StaticContainersRequest, counter: CounterState) -> LootContext<'_> {
+fn loot_context(common: &LootCommon, counter: CounterState) -> LootContext<'_> {
     LootContext {
-        items_view: &request.common.items_view,
-        static_ammo_dist: &request.common.static_ammo_dist,
-        default_presets: &request.common.default_presets,
-        money_tpls: &request.common.money_tpls,
-        lootable_item_blacklist: &request.common.lootable_item_blacklist,
-        config: &request.common.config,
-        seasonal: &request.common.seasonal,
+        items_view: &common.items_view,
+        static_ammo_dist: &common.static_ammo_dist,
+        default_presets: &common.default_presets,
+        money_tpls: &common.money_tpls,
+        lootable_item_blacklist: &common.lootable_item_blacklist,
+        config: &common.config,
+        seasonal: &common.seasonal,
         counter,
         diagnostics: Vec::new(),
     }
@@ -131,7 +126,7 @@ pub fn generate_static_containers(
     let static_forced = request.static_forced.take();
     let statics = request.statics.take();
 
-    let mut ctx = loot_context(&request, counter);
+    let mut ctx = loot_context(&request.common, counter);
     let location_id = request.common.location_id.as_str();
     let config = ctx.config;
     let seasonal = ctx.seasonal;
@@ -846,6 +841,511 @@ fn get_possible_loot_items_for_container(
     item_distribution
 }
 
+/// The spawn point's template id. C# dereferences `Template.Id` unguarded (`:669-672`); an absent
+/// one is simply not a christmas point and not blacklisted here, which keeps the null-template
+/// warning at `:771` reachable.
+fn spawn_point_template_id(spawn_point: &Spawnpoint) -> &str {
+    spawn_point
+        .template
+        .as_ref()
+        .and_then(|template| template.id.as_deref())
+        .unwrap_or_default()
+}
+
+/// `Template.Id.StartsWith("christmas", OrdinalIgnoreCase)` (`:668-673`).
+fn is_christmas_spawn_point(spawn_point: &Spawnpoint) -> bool {
+    spawn_point_template_id(spawn_point)
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("christmas"))
+}
+
+/// `Template.IsAlwaysSpawn.GetValueOrDefault()` (`:678,711`).
+fn is_always_spawn(spawn_point: &Spawnpoint) -> bool {
+    spawn_point
+        .template
+        .as_ref()
+        .and_then(|template| template.is_always_spawn)
+        .unwrap_or(false)
+}
+
+/// `LocationLootGenerator.GenerateDynamicLoot` (`:656-854`) — forced loot, then a weighted draw of
+/// loose spawn points, one item generated per chosen point.
+///
+/// C# mutates `dynamicLootDist` as it goes (the christmas filter, and each chosen point's `Items` /
+/// `Root`). This owns a deserialized copy, so the caller's `LooseLoot` comes back untouched — the
+/// one documented behaviour change of the port.
+pub fn generate_dynamic_loot(
+    mut request: DynamicLootRequest,
+) -> Result<DynamicLootResult, LootError> {
+    // Everything the run mutates is moved out before the rest of the request is lent to the context.
+    let counter = std::mem::take(&mut request.common.counter);
+    let loose_loot = std::mem::take(&mut request.loose_loot);
+
+    let mut ctx = loot_context(&request.common, counter);
+    let location_name = request.common.location_id.as_str();
+    let config = ctx.config;
+    let seasonal = ctx.seasonal;
+
+    // C# enumerates all three unguarded (`:668-685`) and throws on a null without logging first.
+    let (Some(mut spawnpoints), Some(mut spawnpoints_forced), Some(spawnpoint_count)) = (
+        loose_loot.spawnpoints,
+        loose_loot.spawnpoints_forced,
+        loose_loot.spawnpoint_count,
+    ) else {
+        return Err(LootError::new(format!(
+            "Loose loot data for map: {location_name} is incomplete"
+        )));
+    };
+
+    // Remove christmas items from loot data
+    if !seasonal.christmas_event_enabled {
+        spawnpoints.retain(|spawn_point| !is_christmas_spawn_point(spawn_point));
+        spawnpoints_forced.retain(|spawn_point| !is_christmas_spawn_point(spawn_point));
+    }
+
+    // Build the list of forced loot from both `SpawnpointsForced` and any point marked
+    // `IsAlwaysSpawn`. C# shares the point objects between the two lists; the copies here never
+    // diverge, since the main loop skips always-spawn points (`:711`).
+    let mut dynamic_forced_spawn_points = spawnpoints_forced;
+    dynamic_forced_spawn_points.extend(
+        spawnpoints
+            .iter()
+            .filter(|spawn_point| is_always_spawn(spawn_point))
+            .cloned(),
+    );
+
+    let mut loot = get_forced_dynamic_loot(&mut ctx, dynamic_forced_spawn_points, location_name)?;
+
+    // Draw from random distribution
+    let desired_spawn_point_count = random_util::round_half_even(
+        config.loose_loot_multiplier
+            * random_util::get_normally_distributed_random_number(
+                spawnpoint_count.mean,
+                spawnpoint_count.std,
+            ),
+    );
+
+    // Init empty array to hold spawn points, letting us pick them pseudo-randomly
+    let mut spawn_point_array: ProbabilityObjectArray<String, Spawnpoint> =
+        ProbabilityObjectArray::new();
+
+    // Positions not in forced but have 100% chance to spawn
+    let mut guaranteed_loose_points: Vec<Spawnpoint> = Vec::new();
+
+    for spawn_point in spawnpoints {
+        let template_id = spawn_point_template_id(&spawn_point).to_owned();
+
+        // Point is blacklisted, skip
+        if config.loose_loot_blacklist.contains(&template_id) {
+            ctx.diagnostics.push(diagnostic(
+                DEBUG,
+                format!("Ignoring loose loot location: {template_id}"),
+            ));
+
+            continue;
+        }
+
+        // We've handled IsAlwaysSpawn above, so skip them
+        if is_always_spawn(&spawn_point) {
+            continue;
+        }
+
+        // 100%, add it to guaranteed
+        if spawn_point.probability == Some(1.0) {
+            guaranteed_loose_points.push(spawn_point);
+
+            continue;
+        }
+
+        spawn_point_array.add(ProbabilityObject {
+            key: template_id,
+            // C# reads `Probability ?? 0`.
+            relative_probability: spawn_point.probability.unwrap_or(0.0),
+            data: Some(spawn_point),
+        });
+    }
+
+    // Select a number of spawn points to add loot to
+    // Add ALL loose loot with 100% chance to pool
+    let guaranteed_loose_point_count = guaranteed_loose_points.len();
+    let mut chosen_spawn_points = guaranteed_loose_points;
+
+    let random_spawn_point_count = desired_spawn_point_count - chosen_spawn_points.len() as f64;
+    // Only draw random spawn points if needed
+    if random_spawn_point_count > 0.0 && !spawn_point_array.is_empty() {
+        // Add randomly chosen spawn points. `DrawAndRemove` only removes from its own working copy,
+        // which is why `Data` can still find every key it just drew (`:736-738`).
+        for key in spawn_point_array.draw_and_remove(random_spawn_point_count as usize, None) {
+            if let Some(spawn_point) = spawn_point_array.data(&key) {
+                chosen_spawn_points.push(spawn_point.clone());
+            }
+        }
+    }
+
+    // Filter out duplicate locationIds // prob can be done better
+    let mut seen_location_ids: HashSet<Option<String>> = HashSet::new();
+    chosen_spawn_points
+        .retain(|spawn_point| seen_location_ids.insert(spawn_point.location_id.clone()));
+
+    // Do we have enough items in pool to fulfill requirement
+    if desired_spawn_point_count - chosen_spawn_points.len() as f64 > 0.0 {
+        ctx.diagnostics.push(localised(
+            DEBUG,
+            "location-spawn_point_count_requested_vs_found",
+            json!({
+                "requested": desired_spawn_point_count + guaranteed_loose_point_count as f64,
+                "found": chosen_spawn_points.len(),
+                "mapName": location_name,
+            }),
+        ));
+    }
+
+    // Iterate over spawnPoints
+    let seasonal_event_active = seasonal.seasonal_event_active;
+    for mut spawn_point in chosen_spawn_points {
+        // SpawnPoint is invalid, skip it
+        let Some(mut spawn_point_template) = spawn_point.template.take() else {
+            ctx.diagnostics.push(localised(
+                WARNING,
+                "location-missing_dynamic_template",
+                json!(spawn_point.location_id),
+            ));
+
+            continue;
+        };
+
+        // Ensure no blacklisted lootable items are in pool. C# enumerates a null `Items` and throws
+        // (`:779`); an absent pool takes the empty-pool path below instead.
+        let mut items: Vec<SptLootItem> = spawn_point_template
+            .items
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| !ctx.lootable_item_blacklist.contains(&item.item.template))
+            .collect();
+
+        // Ensure no seasonal items are in pool if not in-season
+        if !seasonal_event_active {
+            items.retain(|item| {
+                !seasonal
+                    .inactive_seasonal_items
+                    .contains(&item.item.template)
+            });
+        }
+
+        // Spawn point has no items after filtering, skip
+        if items.is_empty() {
+            ctx.diagnostics.push(localised(
+                DEBUG,
+                "location-spawnpoint_missing_items",
+                json!(spawn_point_template.id),
+            ));
+
+            continue;
+        }
+
+        // Get an array of allowed IDs after above filtering has occured. C# throws on an item
+        // distribution entry with no `composedKey` object at all (`:807`); it reads as the null key
+        // here, which the pool below treats the same as a missing one.
+        let valid_composed_keys: HashSet<&str> = items
+            .iter()
+            .map(|item| item.composed_key.as_deref().unwrap_or_default())
+            .collect();
+
+        // Construct container to hold above filtered items, letting us pick an item for the spot
+        let mut item_array: ProbabilityObjectArray<String, ()> = ProbabilityObjectArray::new();
+        for item_distribution in spawn_point.item_distribution.iter().flatten() {
+            let composed_key = item_distribution
+                .composed_key
+                .as_ref()
+                .and_then(|composed_key| composed_key.key.as_deref())
+                .unwrap_or_default();
+            if !valid_composed_keys.contains(composed_key) {
+                continue;
+            }
+
+            item_array.add(ProbabilityObject {
+                key: composed_key.to_owned(),
+                relative_probability: item_distribution.relative_probability.unwrap_or(0.0),
+                data: None,
+            });
+        }
+
+        if item_array.is_empty() {
+            ctx.diagnostics.push(localised(
+                WARNING,
+                "location-loot_pool_is_empty_skipping",
+                json!(spawn_point_template.id),
+            ));
+
+            continue;
+        }
+
+        // Draw a random item from the spawn points possible items. An all-zero pool draws nothing,
+        // where C# would fall back to `FirstOrDefault`'s null and match an item with a null
+        // composed key; both end up on the warning below for every pool that has one.
+        let chosen_composed_key = item_array.draw(1).into_iter().next();
+        let chosen_item = chosen_composed_key.as_deref().and_then(|composed_key| {
+            items
+                .iter()
+                .find(|item| item.composed_key.as_deref().unwrap_or_default() == composed_key)
+        });
+        let Some(chosen_item) = chosen_item else {
+            ctx.diagnostics.push(diagnostic(
+                WARNING,
+                format!(
+                    "Unable to find item with composed key: {}, skipping spawn point: {} ",
+                    chosen_composed_key.unwrap_or_default(),
+                    spawn_point.location_id.unwrap_or_default()
+                ),
+            ));
+
+            continue;
+        };
+
+        let create_item_result = create_dynamic_loot_item(&mut ctx, chosen_item, &items)?;
+
+        // `Items.FirstOrDefault().Template` (`:836`) throws on the empty list an item with no
+        // children in the pool leaves behind; the point is skipped instead.
+        let Some(root_item) = create_item_result.items.first() else {
+            continue;
+        };
+
+        // If count reaches max, skip adding item to loot
+        if increment_count(&mut ctx.counter, &root_item.template) {
+            continue;
+        }
+
+        // Root id can change when generating a weapon, ensure ids match
+        spawn_point_template.root = Some(root_item.id.clone());
+
+        // Convert the processed items into the correct output type, overwriting the entire pool
+        // with the chosen item
+        spawn_point_template.items = Some(
+            create_item_result
+                .items
+                .iter()
+                .map(item_helper::to_loot_item)
+                .collect(),
+        );
+
+        loot.push(spawn_point_template);
+    }
+
+    Ok(DynamicLootResult {
+        spawnpoints: loot,
+        tracked_counts: ctx.counter.tracked_counts,
+        diagnostics: ctx.diagnostics,
+    })
+}
+
+/// `LocationLootGenerator.GetForcedDynamicLoot` (`:863-919`) — force items into loot spawn points,
+/// primarily quest items.
+fn get_forced_dynamic_loot(
+    ctx: &mut LootContext,
+    forced_spawn_points: Vec<Spawnpoint>,
+    location_name: &str,
+) -> Result<Vec<SpawnpointTemplate>, LootError> {
+    let seasonal = ctx.seasonal;
+    let seasonal_event_active = seasonal.seasonal_event_active;
+
+    let mut result: Vec<SpawnpointTemplate> = Vec::new();
+
+    for forced_loot_location in forced_spawn_points {
+        // C# dereferences the template (`:877`) and its first item (`:879`) unguarded; a point
+        // missing either is skipped here.
+        let Some(mut location_template_to_add) = forced_loot_location.template else {
+            continue;
+        };
+        let items = location_template_to_add.items.take().unwrap_or_default();
+        // `Items.FirstOrDefault(item => item.Id == rootItem.Id)` (`:890`) can only ever find the
+        // root item itself, so the two are one and the same here.
+        let Some(chosen_item) = items.first() else {
+            continue;
+        };
+
+        // Counted before the seasonal check below, so a skipped seasonal point still spends a slot.
+        if increment_count(&mut ctx.counter, &chosen_item.item.template) {
+            continue;
+        }
+
+        // Skip adding seasonal items when seasonal event is not active
+        if !seasonal_event_active
+            && seasonal
+                .inactive_seasonal_items
+                .contains(&chosen_item.item.template)
+        {
+            continue;
+        }
+
+        let create_item_result = create_dynamic_loot_item(ctx, chosen_item, &items)?;
+
+        // `Items.FirstOrDefault().Id` (`:894`) throws on an empty list; the point is skipped instead.
+        let Some(root_item) = create_item_result.items.first() else {
+            continue;
+        };
+
+        // Update root ID with the above dynamically generated ID
+        location_template_to_add.root = Some(root_item.id.clone());
+
+        // Convert the processed items into the correct output type
+        location_template_to_add.items = Some(
+            create_item_result
+                .items
+                .iter()
+                .map(item_helper::to_loot_item)
+                .collect(),
+        );
+
+        // Push forced location into array as long as it doesn't exist already
+        if result
+            .iter()
+            .any(|spawn_point| spawn_point.id == location_template_to_add.id)
+        {
+            ctx.diagnostics.push(diagnostic(
+                DEBUG,
+                format!(
+                    "Attempted to add a forced loot location with Id: {} to map {location_name} that already has that id in use, skipping",
+                    location_template_to_add.id.as_deref().unwrap_or_default()
+                ),
+            ));
+
+            continue;
+        }
+
+        result.push(location_template_to_add);
+    }
+
+    Ok(result)
+}
+
+/// `LocationLootGenerator.CreateDynamicLootItem` (`:928-1015`) — the item that lands in a loose loot
+/// position, with its children.
+fn create_dynamic_loot_item(
+    ctx: &mut LootContext,
+    chosen_item: &SptLootItem,
+    loot_items: &[SptLootItem],
+) -> Result<ContainerItem, LootError> {
+    let items_view = ctx.items_view;
+    let config = ctx.config;
+    let chosen_tpl = chosen_item.item.template.as_str();
+
+    let Some(item_db_template) = item_helper::get_item(items_view, chosen_tpl) else {
+        ctx.diagnostics.push(diagnostic(
+            ERROR,
+            format!("Item tpl: {chosen_tpl} cannot be found in database"),
+        ));
+
+        // **Deviation.** C# logs the line above and carries on (`:936-940`): every branch below
+        // that would dereference the null template is gated by a base-class test, and those answer
+        // false for a tpl the database has never heard of
+        // (`ItemBaseClassService.cs:97-102`), so the item quietly falls through to the children
+        // branch. A loose loot position naming an unknown tpl is bad data, so it stops the run here
+        // instead of half-building an item.
+        return Err(LootError::new(format!(
+            "Item tpl: {chosen_tpl} cannot be found in database"
+        )));
+    };
+
+    // Item array to return
+    let mut item_with_mods: Vec<Item> = Vec::new();
+
+    // Money/Ammo - don't rely on items in spawnPoint.template.Items so we can randomise it ourselves
+    if item_helper::is_of_baseclasses(
+        items_view,
+        chosen_tpl,
+        &[item_helper::MONEY, item_helper::AMMO],
+    ) {
+        // C# reads both `.Value`s and throws when either is absent; 0 stands in for that.
+        let stack_count = if item_db_template.stack_max_size == Some(1) {
+            1
+        } else {
+            random_util::get_int(
+                item_db_template.stack_min_random.unwrap_or(0),
+                item_db_template.stack_max_random.unwrap_or(0),
+            )
+        };
+
+        item_with_mods.push(Item {
+            id: mongo_id::generate(),
+            template: chosen_tpl.to_owned(),
+            upd: Some(Upd {
+                stack_objects_count: Some(f64::from(stack_count)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    } else if item_helper::is_of_baseclass(items_view, chosen_tpl, item_helper::AMMO_BOX) {
+        // Fill with cartridges
+        let mut ammo_box_item = vec![Item {
+            id: mongo_id::generate(),
+            template: chosen_tpl.to_owned(),
+            ..Default::default()
+        }];
+
+        // Both failures are C# crashes inside `AddCartridgesToAmmoBox`; unlike the static path,
+        // there is no null to return here, so the run stops with them.
+        item_helper::add_cartridges_to_ammo_box(ctx, &mut ammo_box_item, chosen_tpl)
+            .map_err(|failure| LootError::new(failure.message.unwrap_or_default()))?;
+
+        item_with_mods.extend(ammo_box_item);
+    } else if item_helper::is_of_baseclass(items_view, chosen_tpl, item_helper::MAGAZINE) {
+        // Create array with just magazine
+        let mut magazine_item = vec![Item {
+            id: mongo_id::generate(),
+            template: chosen_tpl.to_owned(),
+            ..Default::default()
+        }];
+
+        // Yes: the loose path gates on the *static* chance and then fills to the *loose* minimum
+        // (`:974-983`).
+        if random_util::get_chance_100(config.static_magazine_loot_has_ammo_chance_percent) {
+            // Add randomised amount of cartridges
+            item_helper::fill_magazine_with_random_cartridge(
+                ctx,
+                &mut magazine_item,
+                chosen_tpl,
+                None,
+                config.min_fill_loose_magazine_percent / 100.0,
+                None,
+                None,
+            )?;
+        }
+
+        item_with_mods.extend(magazine_item);
+    } else {
+        // Also used by armors to get child mods
+        // Get item + children and add into array we return. `GetItemWithChildren` reads the base
+        // `Item` of each loot item, and clones as it walks, which is the C# `cloner.Clone` too.
+        let pool: Vec<Item> = loot_items.iter().map(|item| item.item.clone()).collect();
+        let mut item_with_children =
+            item_helper::get_item_with_children(&pool, &chosen_item.item.id);
+
+        // Ensure all IDs are unique
+        item_helper::replace_ids(&mut item_with_children);
+
+        if config.tpls_to_strip_child_items_from.contains(chosen_tpl) {
+            // Strip children from parent before adding
+            item_with_children.truncate(1);
+        }
+
+        item_with_mods.extend(item_with_children);
+    }
+
+    // Get inventory size of item. `itemWithMods.FirstOrDefault().Id` (`:1007`) throws on the empty
+    // list an unknown root leaves behind; the size comes out unset here and both callers skip the
+    // spawn point on the same empty list.
+    let size = item_with_mods.first().and_then(|root_item| {
+        item_helper::get_item_size(items_view, &item_with_mods, &root_item.id)
+    });
+
+    Ok(ContainerItem {
+        items: item_with_mods,
+        width: size.map(|(width, _)| width),
+        height: size.map(|(_, height)| height),
+    })
+}
+
 /// `LocationLootGenerator.CreateStaticLootItem` (`:1025-1094`) — HIGHLY BRITTLE, LEGACY CODE.
 fn create_static_loot_item(
     ctx: &mut LootContext,
@@ -1128,6 +1628,8 @@ mod tests {
     const WEAPON_MOD_TPL: &str = "888888888888888888888888";
     const ARMOR_TPL: &str = "999999999999999999999999";
     const ARMOR_MOD_TPL: &str = "aaaaaaaaaaaaaaaaaaaaaaaa";
+    const PLAIN_TPL: &str = "bbbbbbbbbbbbbbbbbbbbbbbb";
+    const SEASONAL_TPL: &str = "cccccccccccccccccccccccc";
     const CALIBER: &str = "Caliber762x39";
 
     /// A container spawn point: probability, spawn-point id, and the container item itself.
@@ -1367,7 +1869,7 @@ mod tests {
     #[test]
     fn adding_loot_leaves_the_request_container_untouched() {
         let request = fixture_request();
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
         let container = &request.static_containers.as_ref().unwrap()[0];
         let before = serde_json::to_value(container).unwrap();
 
@@ -1400,7 +1902,7 @@ mod tests {
     #[test]
     fn weighted_count_errors_when_the_container_is_absent_from_the_loot_dist() {
         let request = fixture_request();
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
 
         assert!(
             get_weighted_count_of_container_items(
@@ -1416,7 +1918,7 @@ mod tests {
     #[test]
     fn containers_by_probability_returns_the_whole_pool_when_it_is_too_small() {
         let request = fixture_request();
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
         let container_data = ContainerGroupCount {
             container_ids_with_probability: HashMap::from([("r1".to_owned(), 0.5)]),
             chosen_count: 3.0,
@@ -1519,7 +2021,7 @@ mod tests {
             ]}
         }))
         .unwrap();
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
 
         let weapon = create_static_loot_item(&mut ctx, WEAPON_TPL, Some("container"))
             .unwrap()
@@ -1548,7 +2050,7 @@ mod tests {
         let mut request = fixture_request();
         request.common.default_presets =
             serde_json::from_value(json!({ WEAPON_TPL: { "items": [] } })).unwrap();
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
 
         assert!(create_static_loot_item(&mut ctx, WEAPON_TPL, None).is_err());
         assert!(ctx.diagnostics.iter().any(|entry| {
@@ -1564,7 +2066,7 @@ mod tests {
             .get_mut(CONTAINER_TPL)
             .unwrap()
             .item_count_distribution = None;
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
 
         let count = get_weighted_count_of_container_items(
             &mut ctx,
@@ -1590,7 +2092,7 @@ mod tests {
     #[test]
     fn static_loot_items_are_hydrated_by_base_class() {
         let request = fixture_request();
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
 
         let money = create_static_loot_item(&mut ctx, MONEY_TPL, Some("parent"))
             .unwrap()
@@ -1628,7 +2130,7 @@ mod tests {
     fn armor_is_hydrated_from_a_preset_or_its_slots() {
         // No preset: the base item made by the caller keeps its parent and gains its slot mods.
         let request = fixture_request();
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
 
         let armor = create_static_loot_item(&mut ctx, ARMOR_TPL, Some("container"))
             .unwrap()
@@ -1648,7 +2150,7 @@ mod tests {
             ]}
         }))
         .unwrap();
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
 
         let armor = create_static_loot_item(&mut ctx, ARMOR_TPL, Some("container"))
             .unwrap()
@@ -1665,6 +2167,296 @@ mod tests {
         assert_eq!((armor.width, armor.height), (Some(3), Some(4)));
     }
 
+    // -----------------------------------------------------------------------
+    // Dynamic (loose) loot
+    // -----------------------------------------------------------------------
+
+    /// One item in a loose loot spawn point; its composed key is derived from its id.
+    fn loose_item(id: &str, tpl: &str) -> serde_json::Value {
+        json!({ "_id": id, "_tpl": tpl, "composedKey": format!("ck_{id}") })
+    }
+
+    /// A child of `parent_id` — no composed key, so it is never an option in its own right.
+    fn loose_child(id: &str, tpl: &str, parent_id: &str) -> serde_json::Value {
+        json!({ "_id": id, "_tpl": tpl, "parentId": parent_id, "slotId": "mod_handguard" })
+    }
+
+    /// A loose loot spawn point holding `items`; every root item is an equally weighted option, and
+    /// the template carries a mod-added field to prove passthrough survives generation.
+    fn loose_point(
+        location_id: &str,
+        probability: f64,
+        template_id: &str,
+        items: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let item_distribution: Vec<serde_json::Value> = items
+            .iter()
+            .filter(|item| item.get("parentId").is_none())
+            .map(|item| {
+                json!({ "composedKey": { "key": item["composedKey"] }, "relativeProbability": 1 })
+            })
+            .collect();
+
+        json!({
+            "locationId": location_id,
+            "probability": probability,
+            "template": {
+                "Id": template_id,
+                "Root": items[0]["_id"],
+                "Items": items,
+                "modAddedField": location_id,
+            },
+            "itemDistribution": item_distribution,
+        })
+    }
+
+    /// Forced loot (two points sharing a template id, one seasonal), a point flagged always-spawn,
+    /// two guaranteed points (money and a weapon with a child mod), a christmas point, a
+    /// blacklisted one, and two weighted points. `mean` 3 with `std` 0 fixes the desired count at 3,
+    /// so exactly one of the two weighted points is drawn.
+    fn fixture_dynamic_request() -> DynamicLootRequest {
+        let mut always_spawn_point = loose_point(
+            "always_1",
+            0.5,
+            "always_1",
+            vec![loose_item("ai1", PLAIN_TPL)],
+        );
+        always_spawn_point["template"]["IsAlwaysSpawn"] = json!(true);
+
+        serde_json::from_value(json!({
+            "locationId": "bigmap",
+            "itemsView": {
+                ITEM_NODE: {},
+                MONEY: { "parent": ITEM_NODE },
+                AMMO: { "parent": ITEM_NODE },
+                AMMO_BOX: { "parent": ITEM_NODE },
+                MAGAZINE: { "parent": ITEM_NODE },
+                WEAPON: { "parent": ITEM_NODE },
+                MONEY_TPL: {
+                    "parent": MONEY, "width": 1, "height": 1,
+                    "stackMaxSize": 500000, "stackMinRandom": 100, "stackMaxRandom": 200
+                },
+                WEAPON_TPL: { "parent": WEAPON, "width": 2, "height": 1 },
+                WEAPON_MOD_TPL: { "parent": ITEM_NODE, "width": 1, "height": 1 },
+                FORCED_TPL: { "parent": ITEM_NODE, "width": 1, "height": 1 },
+                PLAIN_TPL: { "parent": ITEM_NODE, "width": 1, "height": 1 },
+                SEASONAL_TPL: { "parent": ITEM_NODE, "width": 1, "height": 1 },
+            },
+            "defaultPresets": {},
+            "moneyTpls": [MONEY_TPL],
+            "staticAmmoDist": {},
+            "config": {
+                "containerRandomisationEnabled": true, "locationInRandomisationMaps": true,
+                "containerTypesToNotRandomise": [], "containerGroupMinSizeMultiplier": 1,
+                "containerGroupMaxSizeMultiplier": 1, "allowDuplicateItemsInStaticContainers": true,
+                "tplsToStripChildItemsFrom": [], "fitLootIntoContainerAttempts": 3,
+                "magazineLootHasAmmoChancePercent": 100,
+                "staticMagazineLootHasAmmoChancePercent": 100,
+                "minFillLooseMagazinePercent": 30, "minFillStaticMagazinePercent": 30,
+                "staticLootMultiplier": 1, "looseLootMultiplier": 1,
+                "modSpawnChancePercent": {}, "looseLootBlacklist": ["blacklisted_1"]
+            },
+            "seasonal": {
+                "seasonalEventActive": false, "christmasEventEnabled": false,
+                "inactiveSeasonalItems": [SEASONAL_TPL], "christmasContainerIds": []
+            },
+            "lootableItemBlacklist": [],
+            "counter": { "maxCounts": { SEASONAL_TPL: 5 }, "trackedCounts": {} },
+            "looseLoot": {
+                "spawnpointCount": { "mean": 3, "std": 0 },
+                "spawnpointsForced": [
+                    loose_point("f1", 1.0, "forced_1", vec![loose_item("fi1", FORCED_TPL)]),
+                    // Same template id as the point above, so it is logged and dropped.
+                    loose_point("f2", 1.0, "forced_1", vec![loose_item("fi2", FORCED_TPL)]),
+                    loose_point("f3", 1.0, "forced_seasonal", vec![loose_item("fi3", SEASONAL_TPL)]),
+                ],
+                "spawnpoints": [
+                    loose_point("money_1", 1.0, "money_1", vec![loose_item("mi1", MONEY_TPL)]),
+                    loose_point("weapon_1", 1.0, "weapon_1", vec![
+                        loose_item("wi1", WEAPON_TPL),
+                        loose_child("wi2", WEAPON_MOD_TPL, "wi1"),
+                    ]),
+                    loose_point("christmas_1", 1.0, "Christmas_1", vec![loose_item("ci1", PLAIN_TPL)]),
+                    loose_point("blacklisted_1", 1.0, "blacklisted_1", vec![loose_item("bi1", PLAIN_TPL)]),
+                    loose_point("weighted_1", 0.5, "weighted_1", vec![loose_item("wi3", PLAIN_TPL)]),
+                    loose_point("weighted_2", 0.5, "weighted_2", vec![loose_item("wi4", PLAIN_TPL)]),
+                    always_spawn_point,
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn dynamic_ids(result: &DynamicLootResult) -> Vec<&str> {
+        result
+            .spawnpoints
+            .iter()
+            .filter_map(|spawnpoint| spawnpoint.id.as_deref())
+            .collect()
+    }
+
+    fn dynamic_tpls(result: &DynamicLootResult) -> Vec<&str> {
+        result
+            .spawnpoints
+            .iter()
+            .flat_map(|spawnpoint| spawnpoint.items.iter().flatten())
+            .map(|item| item.item.template.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn forced_loot_lands_once_per_template_id() {
+        for _ in 0..25 {
+            let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+            let ids = dynamic_ids(&result);
+
+            assert_eq!(
+                ids.iter().filter(|id| **id == "forced_1").count(),
+                1,
+                "forced point missing or duplicated in {ids:?}"
+            );
+            // The always-spawn point is forced too, and the main loop must not add it a second time.
+            assert_eq!(ids.iter().filter(|id| **id == "always_1").count(), 1);
+            // 2 forced + 2 guaranteed + 1 of the 2 weighted points.
+            assert_eq!(result.spawnpoints.len(), 5, "{ids:?}");
+        }
+
+        let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+        assert!(result.diagnostics.iter().any(|entry| {
+            entry.level == DEBUG
+                && entry.message.as_deref().is_some_and(|message| {
+                    message.starts_with("Attempted to add a forced loot location with Id: forced_1")
+                })
+        }));
+    }
+
+    #[test]
+    fn seasonal_forced_loot_is_counted_before_it_is_skipped() {
+        let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+
+        assert!(!dynamic_ids(&result).contains(&"forced_seasonal"));
+        // `IncrementCount` runs before the seasonal check (`:879-888`), so the skipped point still
+        // counts against the tpl's spawn limit.
+        assert_eq!(result.tracked_counts[SEASONAL_TPL], 1);
+
+        let mut request = fixture_dynamic_request();
+        request.common.seasonal.seasonal_event_active = true;
+
+        let result = generate_dynamic_loot(request).unwrap();
+        assert!(dynamic_ids(&result).contains(&"forced_seasonal"));
+    }
+
+    #[test]
+    fn christmas_and_blacklisted_spawn_points_are_dropped() {
+        for _ in 0..25 {
+            let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+            let ids = dynamic_ids(&result);
+
+            // Both are 100% spawn points, so only the filters can keep them out.
+            assert!(!ids.contains(&"Christmas_1"), "{ids:?}");
+            assert!(!ids.contains(&"blacklisted_1"), "{ids:?}");
+        }
+
+        let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+        assert!(result.diagnostics.iter().any(|entry| {
+            entry.level == DEBUG
+                && entry.message.as_deref() == Some("Ignoring loose loot location: blacklisted_1")
+        }));
+
+        // The christmas point comes back for the event, the blacklisted one never does.
+        let mut request = fixture_dynamic_request();
+        request.common.seasonal.christmas_event_enabled = true;
+
+        let result = generate_dynamic_loot(request).unwrap();
+        assert!(dynamic_ids(&result).contains(&"Christmas_1"));
+    }
+
+    #[test]
+    fn spawn_limits_gate_dynamic_spawn_points() {
+        let mut request = fixture_dynamic_request();
+        request
+            .common
+            .counter
+            .max_counts
+            .insert(MONEY_TPL.to_owned(), 0);
+
+        let result = generate_dynamic_loot(request).unwrap();
+
+        assert!(!dynamic_tpls(&result).contains(&MONEY_TPL));
+        assert!(!dynamic_ids(&result).contains(&"money_1"));
+        assert_eq!(result.tracked_counts[MONEY_TPL], 1);
+        assert_eq!(result.spawnpoints.len(), 4);
+    }
+
+    #[test]
+    fn every_spawn_point_roots_its_first_item() {
+        for _ in 0..25 {
+            let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+
+            for spawnpoint in &result.spawnpoints {
+                let items = spawnpoint.items.as_ref().unwrap();
+                assert_eq!(
+                    spawnpoint.root.as_deref(),
+                    Some(items[0].item.id.as_str()),
+                    "root mismatch on {:?}",
+                    spawnpoint.id
+                );
+                assert!(items.iter().all(|item| mongo_id::is_valid(&item.item.id)));
+                // The pool is overwritten with the chosen item, never appended to.
+                assert!(items.len() <= 2);
+            }
+        }
+    }
+
+    #[test]
+    fn weapon_points_keep_their_children() {
+        let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+
+        let weapon = result
+            .spawnpoints
+            .iter()
+            .find(|spawnpoint| spawnpoint.id.as_deref() == Some("weapon_1"))
+            .expect("the weapon point spawns at 100%");
+        let items = weapon.items.as_ref().unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].item.template, WEAPON_TPL);
+        assert_eq!(items[1].item.template, WEAPON_MOD_TPL);
+        assert_eq!(
+            items[1].item.parent_id.as_deref(),
+            Some(items[0].item.id.as_str())
+        );
+        // Ids are replaced, so nothing collides with the next point built from the same pool.
+        assert_ne!(items[0].item.id, "wi1");
+        // `ToLootItem` drops the composed key.
+        assert!(items.iter().all(|item| item.composed_key.is_none()));
+    }
+
+    #[test]
+    fn results_round_trip_through_serde() {
+        let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+
+        let serialized = serde_json::to_value(&result.spawnpoints).unwrap();
+        let reparsed: Vec<SpawnpointTemplate> = serde_json::from_value(serialized.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(&reparsed).unwrap(), serialized);
+        // Mod-added fields ride through generation untouched.
+        for spawnpoint in serialized.as_array().unwrap() {
+            assert!(spawnpoint["modAddedField"].is_string(), "{spawnpoint}");
+        }
+    }
+
+    #[test]
+    fn missing_loose_loot_data_is_fatal() {
+        let mut request = fixture_dynamic_request();
+        request.loose_loot.spawnpoints = None;
+        assert!(generate_dynamic_loot(request).is_err());
+
+        let mut request = fixture_dynamic_request();
+        request.loose_loot.spawnpoint_count = None;
+        assert!(generate_dynamic_loot(request).is_err());
+    }
+
     #[test]
     fn the_loot_pool_drops_out_of_season_and_blacklisted_items() {
         let mut request = fixture_request();
@@ -1677,7 +2469,7 @@ mod tests {
             .common
             .lootable_item_blacklist
             .insert(AMMO_BOX_TPL.to_owned());
-        let mut ctx = loot_context(&request, CounterState::default());
+        let mut ctx = loot_context(&request.common, CounterState::default());
 
         let pool = get_possible_loot_items_for_container(
             &mut ctx,
