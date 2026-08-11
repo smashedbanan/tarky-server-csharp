@@ -107,7 +107,8 @@ public static class SptNative
                     &outPtr,
                     &outLen
                 ),
-                _ => NativeMethods.GenerateDynamicLoot(requestPtr, (nuint)requestUtf8.Length, &outPtr, &outLen),
+                LootExport.DynamicLoot => NativeMethods.GenerateDynamicLoot(requestPtr, (nuint)requestUtf8.Length, &outPtr, &outLen),
+                _ => throw new ArgumentOutOfRangeException(nameof(export), export, null),
             };
         }
 

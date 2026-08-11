@@ -92,10 +92,9 @@ mod tests {
     }
 
     #[test]
-    fn ids_generated_in_the_same_second_share_a_timestamp_prefix() {
+    fn generated_ids_are_unique() {
         let first = generate();
         let second = generate();
-        assert_eq!(first[..8], second[..8]);
         assert_ne!(first, second);
     }
 

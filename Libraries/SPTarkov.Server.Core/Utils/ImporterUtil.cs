@@ -262,7 +262,14 @@ public sealed class ImporterUtil(ISptLogger<ImporterUtil> logger, FileUtil fileU
         // The file the deserialisation reads, handed over unparsed for callers that only re-encode it
         Func<ReadOnlyMemory<byte>?> readRawJson = () =>
         {
-            return File.Exists(file) ? new ReadOnlyMemory<byte>(File.ReadAllBytes(file)) : null;
+            if (!File.Exists(file))
+            {
+                return null;
+            }
+
+            var bytes = File.ReadAllBytes(file);
+            ReadOnlySpan<byte> utf8Bom = [0xEF, 0xBB, 0xBF]; // serde_json rejects it; System.Text.Json tolerates it
+            return bytes.AsSpan().StartsWith(utf8Bom) ? bytes.AsMemory(utf8Bom.Length) : bytes;
         };
 
         return Activator.CreateInstance(propertyType, expressionDelegate, readRawJson);
