@@ -146,9 +146,16 @@ and `Pages/Tools/` (MongoId generation). UI strings go through `WebLocalizationS
 ## Mods
 
 A mod DLL in `user/mods/` implements exactly one `IModMetadata` (GUID, semver, `SptVersion` range,
-dependencies, incompatibilities) plus any number of `[Injectable]` classes. Registrations are
-applied in ascending `TypePriority` order and the container resolves the last one, so a mod
-replaces a core service by registering against the same base type with a higher `TypePriority`.
+dependencies, incompatibilities) plus any number of `[Injectable]` classes, registered against
+themselves, their interfaces and their base types. `DependencyInjectionHandler.InjectAll` applies
+them in ascending `TypePriority` order and the container resolves the last registration — but
+`[Injectable]` defaults `TypePriority` to `int.MaxValue` and `ProgramHelpers` scans the core assembly
+after the mod assemblies, so raising `TypePriority` cannot put a mod ahead of a core service and
+lowering it only registers the mod earlier, which loses the resolve. Replacing a core registration
+means adding it from `IOnDIConstruct.OnDIConstructAsync`, which runs after `InjectAll` and therefore
+lands last, or patching the type at runtime. Substituting the implementation only changes behaviour
+where the call site goes through an interface or a `virtual` member; a non-virtual method called on a
+concrete injected type runs its own body whatever instance it is handed.
 `Testing/TestMod` is the reference implementation.
 
 `HasPrepatcher = true` opts into enum prepatching from `user/patchers/{ModGuid}`. Runtime method
@@ -229,8 +236,12 @@ payload, hands it to `spt_generate_static_containers` or `spt_generate_dynamic_l
 the log lines the native side collected instead of writing itself — `ReplayDiagnostics` resolves a
 level plus a locale key and its args back through `ServerLocalisationService`. Rolling, packing and
 item assembly live in `rust/spt-native/src/loot/`; `Native/Loot/LootPayloads.cs` mirrors
-`loot/models.rs` member for member, and those Rust models carry a `#[serde(flatten)] extra` map so
-mod-added fields survive the round trip. `CounterTrackerHelper` state crosses in both directions, so
+`loot/models.rs` member for member. The DB/EFT models in `loot/models.rs` — `Item`,
+`SpawnpointTemplate`, `LooseLoot`, `Spawnpoint`, `StaticLootDetails` and the rest mirroring records
+under `Models` — each carry a `#[serde(flatten)] extra` map matching the `[JsonExtensionData]`
+property Ceciler injects into those types, so mod-added fields on game data survive the trip. The
+request and response envelopes are a new C#-to-Rust contract and deliberately have no passthrough
+map, on either side of the boundary. `CounterTrackerHelper` state crosses in both directions, so
 per-location spawn limits span the static and dynamic phases of one raid.
 
 How the payload is sourced decides how much of the old extension surface survives:
@@ -248,10 +259,11 @@ How the payload is sourced decides how much of the old extension surface survive
 **Two loose-loot paths.** `GenerateDynamicLoot`'s `dynamicLootDist` is nullable: null means "use the
 location's `looseLoot.json` as the raw bytes it sits on disk as", which `LooseLootPayload` splices
 into the request unparsed. `GenerateLocationLoot` takes that path whenever the location's `LooseLoot`
-`LazyLoad` has no registered transformer — with none registered the raw file is if anything the more
-faithful input, since explicit nulls and members the C# models do not declare survive it. Any
-registered transformer (a seasonal event registers one during the christmas windows; a mod can too)
-forces the typed path, which parses and re-encodes 42 MB for `bigmap`: ~1347 ms per raid start
+`LazyLoad` has no registered transformer *and* a raw JSON source — with no transformer the raw file
+is if anything the more faithful input, since explicit nulls and members the C# models do not
+declare survive it; a transformer-free `LazyLoad` built without a raw source just takes the typed
+path. Any registered transformer (a seasonal event registers one during the christmas windows; a mod
+can too) forces the typed path, which parses and re-encodes 42 MB for `bigmap`: ~1347 ms per raid start
 against ~345 ms raw, versus 929.83 ms for the C# it replaced. That cost is the accepted ceiling of
 the typed path, and why `GenerateLocationLootBeatsTheCSharpBaseline` pins its timed section to the
 raw path. `PostDbLoadService` registers its loot-adjustment transformers only for maps whose
@@ -261,30 +273,37 @@ transformer, throws rather than generating from nothing.
 
 **Preserved for mods.**
 
-- Replacing `LocationLootGenerator` through DI — register a subclass at a higher `TypePriority`, as
-  with any service — and runtime patches on its three public methods, arguments and results
-  included.
+- Runtime patches on the three public methods (`SPTarkov.Reflection`), arguments and results
+  included. For this class that is *the* behaviour-replacement channel — see the note on subclassing
+  below.
 - Every form of data mutation: database tables, `SPT_Data` JSON, the configs the payload reads, and
   `LazyLoad` transformers, which are the supported channel for changing loose loot.
-- Overrides of the services the payload is built from — `ItemFilterService`, `PresetHelper`,
-  `SeasonalEventService`, `CounterTrackerHelper`'s state accessors, `ServerLocalisationService` —
-  all queried live while the payload is built.
-- Fields the C# and Rust models do not declare, on both the request and the result.
+- Whatever the services behind the payload return at call time — `ItemFilterService`,
+  `PresetHelper`, `SeasonalEventService`, `CounterTrackerHelper`'s state accessors — since the
+  payload is rebuilt from them on every call rather than from a snapshot taken at startup.
+- Fields the C# and Rust models do not declare on the *game data* crossing the boundary — items,
+  spawn points, containers — which ride through the Rust `extra` maps in both directions. Fields
+  added at the envelope level are dropped, in both directions.
 
 **Broken for mods.**
 
 - The 16 protected methods that used to hold the generation logic are gone. A subclass overriding
   them fails to compile and a patch naming them fails to apply, rather than silently doing nothing.
+- The two public types they used, `ContainerGroupCount` and `ContainerItem`, are gone with them: a
+  compile break for anything that named them.
 - The constructor no longer takes `RandomUtil` and now takes `TemplateTable` — visible to subclasses
   at compile time.
-- `RandomUtil` overrides do not affect loot rolls: every roll happens natively.
-- `ItemHelper` overrides are bypassed inside loot generation (only `GetMoneyTpls` is still called
-  through it) — database edits still land, assembly-level overrides do not.
+- Subclassing to change what generation does. The three public methods are not virtual and
+  `LocationLifecycleService` injects the concrete `LocationLootGenerator`, so a subclass registered
+  over it is constructed and injected but its bodies never run for those calls. Patch instead.
+- `RandomUtil` is not consulted for loot rolls at all: every roll happens natively.
+- `ItemHelper` is not consulted inside loot generation beyond `GetMoneyTpls`, so patches on it do not
+  reach the items view — database edits still land, changes to its code do not.
 - `CounterTrackerHelper.IncrementCount` is not invoked per item; only the counts round-trip, so
   per-item logic patched into it never runs during generation.
-- A patch on `GenerateDynamicLoot` that mutates the `looseLoot` **argument** is not honoured on the
-  raw path, where that argument is null. Register a `LazyLoad` transformer instead — which also puts
-  that map on the typed path.
+- A patch on `GenerateDynamicLoot` that mutates its `dynamicLootDist` **argument** is not honoured on
+  the raw path, where that argument is null. Register a `LazyLoad` transformer instead — which also
+  puts that map on the typed path.
 - Reading `DynamicLootRequest.LooseLoot` gets a `LooseLootPayload`, not a `LooseLoot` (a `LooseLoot`
   assigned to it converts implicitly). Source-compatible for writers, not for readers.
 - Returned spawn points are freshly deserialised objects, not reference-identical to anything inside
@@ -294,6 +313,7 @@ transformer, throws rather than generating from nothing.
 
 **Rule for future ports.** A static wrapper like `SptNative` is acceptable only for startup-internal
 subsystems that mods never touch. Anything mods can override or patch — bot and ragfair generation
-are the intended next ports — must stay an `[Injectable]` service resolved through DI and
-overridable by `TypePriority`, with the Rust call made from inside it, as `LocationLootGenerator`
-does. A static class cannot be overridden, mocked, or patched by `SPTarkov.Reflection`.
+are the intended next ports — must keep an `[Injectable]` service as its entry point, with the Rust
+call made from inside it, as `LocationLootGenerator` does. An instance method on a resolved service
+can be patched by `SPTarkov.Reflection` and its registration replaced; a static class can be neither
+patched, mocked, nor overridden.
