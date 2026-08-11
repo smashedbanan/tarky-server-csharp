@@ -96,10 +96,13 @@ impl<K: Clone + PartialEq, V> ProbabilityObjectArray<K, V> {
     /// Draws `item_count_to_draw` keys, removing each pick from the working pool unless it is
     /// whitelisted, mirroring `DrawAndRemove` (`ProbabilityObjectArray.cs:182-238`).
     ///
-    /// The removals happen on a local copy — like the C#, the array itself is left whole, because
-    /// `GenerateDynamicLoot` looks up `data` for the keys it just drew.
+    /// The removals happen on a local copy, so despite the name the array itself is left whole —
+    /// that is the C# behaviour (`ProbabilityObjectArray.cs:190,233`) and `GenerateDynamicLoot`
+    /// depends on it, calling `data` for every key it just drew
+    /// (`LocationLootGenerator.cs:736-738`). Hence `&self`: removing here would silently empty
+    /// every dynamic-loot spawn point.
     pub fn draw_and_remove(
-        &mut self,
+        &self,
         item_count_to_draw: usize,
         never_remove_whitelist: Option<&[K]>,
     ) -> Vec<K> {
@@ -186,6 +189,7 @@ mod tests {
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
         assert!(empty.draw(5).is_empty());
+        assert!(empty.draw_and_remove(5, None).is_empty());
     }
 
     #[test]
@@ -211,7 +215,7 @@ mod tests {
         //
         // `DrawAndRemove` aims at `rand * 0` = 0 instead, and the very first subtraction leaves
         // `0 - 0 <= 0` -> index 0 is picked every time.
-        let mut array = pool(&[("a", 0.0), ("b", 0.0), ("c", 0.0)]);
+        let array = pool(&[("a", 0.0), ("b", 0.0), ("c", 0.0)]);
 
         assert!(array.draw(5).is_empty());
         assert_eq!(array.draw_and_remove(1, None), vec!["a".to_string()]);
@@ -223,7 +227,7 @@ mod tests {
 
     #[test]
     fn draw_and_remove_stops_once_the_pool_empties() {
-        let mut array = pool(&[("a", 1.0), ("b", 2.0), ("c", 3.0)]);
+        let array = pool(&[("a", 1.0), ("b", 2.0), ("c", 3.0)]);
 
         let mut drawn = array.draw_and_remove(10, None);
 
@@ -234,18 +238,24 @@ mod tests {
 
     #[test]
     fn draw_and_remove_never_removes_whitelisted_keys() {
-        let mut array = pool(&[("a", 1.0), ("b", 1.0)]);
+        // The lopsided weights pin the other half of the whitelist branch: `total_weight` must be
+        // left alone too, not just the pool. Decrementing it on a whitelisted pick would take it
+        // 101 -> 1 -> -99, and since every aim value below 'a's weight of 100 resolves to 'a', 'b'
+        // would become unreachable after the first draw. Over 5000 draws 'b' is otherwise certain
+        // to come up (miss odds ~1e-21).
+        let array = pool(&[("a", 100.0), ("b", 1.0)]);
         let whitelist = vec!["a".to_string()];
 
-        let drawn = array.draw_and_remove(10, Some(&whitelist));
+        let drawn = array.draw_and_remove(5000, Some(&whitelist));
 
-        // 'b' can be drawn once and is then gone; 'a' stays in the pool forever, so the loop runs
-        // the full ten iterations instead of stopping at two.
-        assert_eq!(drawn.len(), 10);
-        assert!(count(&drawn, "b") <= 1, "{drawn:?} removed nothing");
-        assert!(
-            count(&drawn, "a") >= 9,
-            "{drawn:?} dropped the whitelisted key"
+        // 'a' stays in the pool forever, so the loop runs every iteration instead of stopping once
+        // 'b' is gone.
+        assert_eq!(drawn.len(), 5000);
+        // Drawn once, then removed — never more, never less.
+        assert_eq!(
+            count(&drawn, "b"),
+            1,
+            "'b' was drawn the wrong number of times"
         );
     }
 
@@ -261,7 +271,7 @@ mod tests {
         let mut middle = 0;
 
         for _ in 0..10_000 {
-            let mut array = pool(&[("a", 1.0), ("b", 1.0), ("c", 1.0), ("huge", 1e16)]);
+            let array = pool(&[("a", 1.0), ("b", 1.0), ("c", 1.0), ("huge", 1e16)]);
             let drawn = array.draw_and_remove(2, None);
 
             assert_eq!(drawn.len(), 2);
@@ -285,7 +295,7 @@ mod tests {
         // The C# removes from a local copy of the pool, never from the array. `GenerateDynamicLoot`
         // (`LocationLootGenerator.cs:736-738`) depends on it: it calls `Data` for every key it just
         // drew, which would come back empty if the entries were gone.
-        let mut array = pool(&[("a", 1.0), ("b", 1.0), ("c", 1.0)]);
+        let array = pool(&[("a", 1.0), ("b", 1.0), ("c", 1.0)]);
 
         let drawn = array.draw_and_remove(3, None);
 
