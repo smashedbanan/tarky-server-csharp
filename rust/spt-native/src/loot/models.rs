@@ -221,12 +221,19 @@ pub struct StaticForced {
 }
 
 /// `Models/Eft/Common/Location.cs` — note the lowercase `c` in `itemcountDistribution`.
+///
+/// Both members are declared non-nullable in C# yet explicitly null-checked at every read
+/// (`LocationLootGenerator.cs:556,592`), because bad map data leaves them null at runtime. `Option`
+/// keeps those two branches reachable — an absent distribution is not the same as an empty one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StaticLootDetails {
-    #[serde(rename = "itemcountDistribution")]
-    pub item_count_distribution: Vec<ItemCountDistribution>,
-    #[serde(rename = "itemDistribution")]
-    pub item_distribution: Vec<ItemDistribution>,
+    #[serde(
+        rename = "itemcountDistribution",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub item_count_distribution: Option<Vec<ItemCountDistribution>>,
+    #[serde(rename = "itemDistribution", skip_serializing_if = "Option::is_none")]
+    pub item_distribution: Option<Vec<ItemDistribution>>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -371,7 +378,7 @@ pub struct PresetView {
     pub items: Vec<Item>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LootConfigView {
     pub container_randomisation_enabled: bool,
@@ -397,7 +404,7 @@ pub struct LootConfigView {
     pub loose_loot_blacklist: HashSet<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeasonalView {
     pub seasonal_event_active: bool,
@@ -418,9 +425,12 @@ pub struct CounterState {
 pub struct StaticContainersRequest {
     #[serde(flatten)]
     pub common: LootCommon,
-    pub static_weapons: Vec<SpawnpointTemplate>,
-    pub static_containers: Vec<StaticContainerData>,
-    pub static_forced: Vec<StaticForced>,
+    /// The three `StaticContainerDetails` members are `Option` because
+    /// `LocationLootGenerator.cs:105,114,121` each test theirs for null and log a map-specific
+    /// error; keeping them non-optional would make those three branches unreachable.
+    pub static_weapons: Option<Vec<SpawnpointTemplate>>,
+    pub static_containers: Option<Vec<StaticContainerData>>,
+    pub static_forced: Option<Vec<StaticForced>>,
     pub static_loot_dist: HashMap<String, StaticLootDetails>,
     pub statics: Option<StaticContainer>,
 }
@@ -563,11 +573,15 @@ mod tests {
             parsed.common.items_view["aaaaaaaaaaaaaaaaaaaaaaaa"].width,
             Some(2)
         );
-        assert_eq!(parsed.static_weapons[0].id.as_deref(), Some("w1"));
-        assert_eq!(parsed.static_containers[0].probability, Some(0.35));
-        assert_eq!(parsed.static_forced[0].container_id, "c1");
+        assert_eq!(parsed.static_weapons.unwrap()[0].id.as_deref(), Some("w1"));
+        assert_eq!(parsed.static_containers.unwrap()[0].probability, Some(0.35));
+        assert_eq!(parsed.static_forced.unwrap()[0].container_id, "c1");
         assert_eq!(
-            parsed.static_loot_dist["eeeeeeeeeeeeeeeeeeeeeeee"].item_count_distribution[0].count,
+            parsed.static_loot_dist["eeeeeeeeeeeeeeeeeeeeeeee"]
+                .item_count_distribution
+                .as_ref()
+                .unwrap()[0]
+                .count,
             Some(1)
         );
         assert_eq!(

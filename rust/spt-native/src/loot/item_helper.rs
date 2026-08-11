@@ -3,7 +3,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::models::{Diagnostic, Item, ItemView, SptLootItem, StaticAmmoDetails, Upd};
+use super::models::{
+    CounterState, Diagnostic, Item, ItemView, LootConfigView, PresetView, SeasonalView,
+    SptLootItem, StaticAmmoDetails, Upd,
+};
 use super::probability_object_array::{ProbabilityObject, ProbabilityObjectArray};
 use super::{mongo_id, random_util};
 
@@ -297,14 +300,21 @@ const DEBUG: &str = "debug";
 const WARNING: &str = "warning";
 const ERROR: &str = "error";
 
-/// The read-only views a generation run consults, plus the diagnostics it accumulates for the C#
-/// caller to replay through its logger.
+/// The read-only views a generation run consults, plus the two things it mutates as it goes: the
+/// spawn-limit counters and the diagnostics the C# caller replays through its logger.
 ///
-/// Only the members the assembly functions below read live here; later tasks add the config values
-/// the generator itself needs.
+/// Every view is borrowed for `'a`, so copying one out (`let items_view = ctx.items_view;`) releases
+/// the `&mut ctx` and leaves the diagnostics writable — the ported functions lean on that.
 pub struct LootContext<'a> {
     pub items_view: &'a HashMap<String, ItemView>,
     pub static_ammo_dist: &'a HashMap<String, Vec<StaticAmmoDetails>>,
+    pub default_presets: &'a HashMap<String, PresetView>,
+    pub money_tpls: &'a [String],
+    pub lootable_item_blacklist: &'a HashSet<String>,
+    pub config: &'a LootConfigView,
+    pub seasonal: &'a SeasonalView,
+    /// `CounterTrackerHelper`'s state, moved in for the run and handed back in the result.
+    pub counter: CounterState,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -812,6 +822,8 @@ fn draw_ammo_tpl(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use super::*;
 
     use serde_json::json;
@@ -1270,9 +1282,23 @@ mod tests {
         items_view: &'a HashMap<String, ItemView>,
         static_ammo_dist: &'a HashMap<String, Vec<StaticAmmoDetails>>,
     ) -> LootContext<'a> {
+        // The assembly functions read neither presets, money, blacklist, config nor season, so
+        // those members are stubbed and the fixtures stay about ammo.
+        static PRESETS: LazyLock<HashMap<String, PresetView>> = LazyLock::new(HashMap::new);
+        static MONEY_TPLS: LazyLock<Vec<String>> = LazyLock::new(Vec::new);
+        static BLACKLIST: LazyLock<HashSet<String>> = LazyLock::new(HashSet::new);
+        static CONFIG: LazyLock<LootConfigView> = LazyLock::new(LootConfigView::default);
+        static SEASONAL: LazyLock<SeasonalView> = LazyLock::new(SeasonalView::default);
+
         LootContext {
             items_view,
             static_ammo_dist,
+            default_presets: &PRESETS,
+            money_tpls: &MONEY_TPLS,
+            lootable_item_blacklist: &BLACKLIST,
+            config: &CONFIG,
+            seasonal: &SEASONAL,
+            counter: CounterState::default(),
             diagnostics: Vec::new(),
         }
     }
