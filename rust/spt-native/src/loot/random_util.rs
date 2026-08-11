@@ -36,8 +36,10 @@ pub fn get_chance_100(chance_percent: f64) -> bool {
 /// A normally distributed draw via the Box-Muller transform, matching
 /// `RandomUtil.GetNormallyDistributedRandomNumber` (`RandomUtil.cs:215-246`).
 ///
-/// Negative draws are rerolled; past 100 retries the C# gives up and returns a flat
-/// `get_double(0.01, mean * 2)` instead. The C# recurses, this loops — same cap, same fallback.
+/// Negative draws are rerolled. The C# checks `attempt > 100` *after* drawing and recurses with
+/// `attempt + 1`, so 102 draws are made before it gives up and returns a flat
+/// `get_double(0.01, mean * 2)` instead. This loops where the C# recurses — same count, same
+/// fallback.
 pub fn get_normally_distributed_random_number(mean: f64, sigma: f64) -> f64 {
     let mut rng = rand::rng();
     let mut attempt = 0;
@@ -126,6 +128,17 @@ mod tests {
     fn get_chance_100_always_fires_at_one_hundred_percent() {
         for _ in 0..1000 {
             assert!(get_chance_100(100.0));
+        }
+    }
+
+    #[test]
+    fn get_chance_100_always_fires_at_ninety_nine_percent() {
+        // The roll tops out at 99, so 99% is already a certainty. This is the assertion that
+        // discriminates the ported 1-99 roll from an innocent-looking `get_int(1, 100)`: under
+        // 1-100 a roll of 100 loses here ~1% of the time, which 1000 trials catch. The 100.0 case
+        // above cannot tell the two apart, since `roll <= 100` holds either way.
+        for _ in 0..1000 {
+            assert!(get_chance_100(99.0));
         }
     }
 
