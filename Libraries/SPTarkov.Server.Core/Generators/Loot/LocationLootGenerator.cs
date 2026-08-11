@@ -116,7 +116,7 @@ public class LocationLootGenerator(
                 LootableItemBlacklist = common.LootableItemBlacklist,
                 Counter = common.Counter,
                 // Nulls are passed through, not replaced with empty lists - the native side logs a
-                // map-specific error for each missing list, exactly as this method used to
+                // map-specific error for each missing list
                 StaticWeapons = staticContainerDetails.StaticWeapons,
                 StaticContainers = staticContainerDetails.StaticContainers,
                 StaticForced = staticContainerDetails.StaticForced,
@@ -167,7 +167,7 @@ public class LocationLootGenerator(
 
         ReplayDiagnostics(result.Diagnostics);
 
-        // Keep the tracker in step with what the native side counted, as the in-place increments did
+        // Keep the tracker in step with what the native side counted
         counterTrackerHelper.SetTrackedCounts(result.TrackedCounts);
 
         return result.Spawnpoints;
@@ -185,7 +185,7 @@ public class LocationLootGenerator(
             LocationId = locationId,
             ItemsView = BuildItemsView(),
             DefaultPresets = presetHelper
-                .GetDefaultPresetsByTplKey()
+                .GetDefaultPresetByTpl()
                 .ToDictionary(preset => preset.Key, preset => new PresetView { Items = preset.Value.Items }),
             MoneyTpls = itemHelper.GetMoneyTpls(),
             StaticAmmoDist = staticAmmoDist.ToDictionary(caliber => caliber.Key, caliber => caliber.Value.ToList()),
@@ -197,7 +197,8 @@ public class LocationLootGenerator(
                 InactiveSeasonalItems = seasonalEventService.GetInactiveSeasonalEventItems(),
                 ChristmasContainerIds = seasonalEventConfig.ChristmasContainerIds,
             },
-            LootableItemBlacklist = itemFilterService.GetBlacklistedLootableItems(),
+            // The cache, not the config list: it also holds anything a mod blacklisted at runtime
+            LootableItemBlacklist = itemFilterService.GetLootableItemBlacklistCache(),
             Counter = new CounterState
             {
                 MaxCounts = counterTrackerHelper.GetMaxCounts(),
@@ -314,8 +315,7 @@ public class LocationLootGenerator(
     {
         foreach (var diagnostic in diagnostics)
         {
-            var isDebug = diagnostic.Level == "debug";
-            if (isDebug && !logger.IsLogEnabled(LogLevel.Debug))
+            if (diagnostic.Level == "debug" && !logger.IsLogEnabled(LogLevel.Debug))
             {
                 continue;
             }

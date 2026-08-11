@@ -52,6 +52,42 @@ public class PresetHelper(GlobalTable globalTable, ItemHelper itemHelper, IClone
     }
 
     /// <summary>
+    /// Get the default preset of every tpl that has one, resolved exactly as
+    /// <see cref="GetDefaultPreset"/> resolves a single tpl: the default-flagged preset when it is a
+    /// weapon or equipment default, otherwise the first preset the tpl has. Presets are not cloned
+    /// </summary>
+    /// <returns>Presets keyed by the tpl they are the default for</returns>
+    public Dictionary<MongoId, Preset> GetDefaultPresetByTpl()
+    {
+        // Fills the two caches GetDefaultPreset reads, so a tpl is never pushed down the fallback
+        // path just because nothing has asked for the defaults yet
+        var weaponPresets = GetDefaultWeaponPresets();
+        var equipmentPresets = GetDefaultEquipmentPresets();
+
+        var defaultPresets = new Dictionary<MongoId, Preset>(PresetCache.Count);
+        foreach (var (templateId, presetDetails) in PresetCache)
+        {
+            if (presetDetails.DefaultId is null)
+            {
+                continue;
+            }
+
+            if (
+                !weaponPresets.TryGetValue(presetDetails.DefaultId.Value, out var defaultPreset)
+                && !equipmentPresets.TryGetValue(presetDetails.DefaultId.Value, out defaultPreset)
+            )
+            {
+                // Default not found in weapon or equipment, use first preset in list
+                defaultPreset = globalTable.ItemPresets[presetDetails.PresetIds.First()];
+            }
+
+            defaultPresets[templateId] = defaultPreset;
+        }
+
+        return defaultPresets;
+    }
+
+    /// <summary>
     /// Get default weapon presets
     /// </summary>
     /// <returns></returns>

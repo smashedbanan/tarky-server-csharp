@@ -59,6 +59,16 @@ public class ItemFilterService(ItemConfig itemConfig)
     }
 
     /// <summary>
+    ///     Return every template id <see cref="IsLootableItemBlacklisted"/> rejects: the config/item.json
+    ///     blacklist plus anything added at runtime through <see cref="AddItemToLootableBlacklistCache"/>
+    /// </summary>
+    /// <returns>HashSet of blacklisted template ids</returns>
+    public HashSet<MongoId> GetLootableItemBlacklistCache()
+    {
+        return LootableItemBlacklistCache;
+    }
+
+    /// <summary>
     /// Add MongoIds to the global lootable item blacklist cache
     /// </summary>
     /// <param name="itemTplsToBlacklist">Tpls to blacklist</param>
