@@ -13,6 +13,12 @@ pub struct FindSlotResult {
 }
 
 /// `ContainerExtensions.FindSlotForItem` (`ContainerExtensions.cs:14-76`).
+///
+/// Both dimensions must be positive. A zero one drives the limits *past* the grid
+/// (`min(w, h) == 0` gives `limit_y = rows + 1`) and, depending on the grid, either reports a bogus
+/// fit — the per-cell sweep spans an empty range, so a 0-wide item "fits" any free cell — or walks
+/// off the end and panics, which is the C#'s `IndexOutOfRangeException` path. Callers must skip an
+/// item whose size is null or 0 rather than pass it through as 0.
 pub fn find_slot_for_item(
     container_2d: &[Vec<u8>],
     item_width_x: i32,
@@ -270,6 +276,47 @@ mod tests {
     }
 
     #[test]
+    fn find_slot_prefers_the_unrotated_fit_when_both_orientations_fit() {
+        let container = grid(3, 3);
+
+        // Row 0 / column 0 takes a 2 wide x 1 high item either way round, and the unrotated check
+        // runs first, so rotation stays off. Trying the rotated orientation first would report
+        // `rotation: true` here and stamp a 1x2 footprint instead of a 2x1 one.
+        let result = find_slot_for_item(&container, 2, 1);
+
+        assert_eq!(
+            result,
+            FindSlotResult {
+                success: true,
+                x: 0,
+                y: 0,
+                rotation: false,
+            }
+        );
+    }
+
+    #[test]
+    fn find_slot_tries_both_orientations_per_cell_before_moving_on() {
+        // Rotation is attempted at each cell, not in a second pass over the whole grid: 2 wide x 1
+        // high cannot start at (0, 0) (taken) and cannot fit unrotated at (0, 1) (one column left),
+        // but rotated it stands in column 1 across both rows. A full unrotated pass followed by a
+        // full rotated pass would settle for (0, 1) unrotated instead.
+        let container = vec![vec![1, 0], vec![0, 0]];
+
+        let result = find_slot_for_item(&container, 2, 1);
+
+        assert_eq!(
+            result,
+            FindSlotResult {
+                success: true,
+                x: 1,
+                y: 0,
+                rotation: true,
+            }
+        );
+    }
+
+    #[test]
     fn find_slot_loop_bounds_use_the_smaller_dimension_quirk() {
         // Quirk 1: both limits come from `min(w, h) - 1` rather than the dimension that actually
         // bounds each axis (`ContainerExtensions.cs:20-24`).
@@ -300,6 +347,8 @@ mod tests {
     #[test]
     fn find_slot_fails_without_panicking_when_the_bounds_go_negative() {
         // 2x2 grid, 5x5 item: minVolume = 4, so limitY = limitX = -2 and neither loop body runs.
+        // Only oversized items are safe this way — a 0-sized one overshoots instead and panics, see
+        // the note on `find_slot_for_item`.
         let container = grid(2, 2);
 
         assert!(!find_slot_for_item(&container, 5, 5).success);
