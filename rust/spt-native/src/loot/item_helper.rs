@@ -1,10 +1,11 @@
 //! The slice of `Helpers/Items/ItemHelper.cs` and `Extensions/ItemExtensions.cs` the loot generator
 //! leans on: template lookups, base-class tests, item-tree cloning/re-iding, and container sizing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::models::{Item, ItemView, SptLootItem};
-use super::mongo_id;
+use super::models::{Diagnostic, Item, ItemView, SptLootItem, StaticAmmoDetails, Upd};
+use super::probability_object_array::{ProbabilityObject, ProbabilityObjectArray};
+use super::{mongo_id, random_util};
 
 // Base-class tpls, copied verbatim from `Models/Enums/BaseClasses.cs`. They live here rather than in
 // their own module because `item_helper` is the only place base classes are ever tested against.
@@ -285,6 +286,528 @@ pub fn to_loot_item(item: &Item) -> SptLootItem {
         item: item.clone(),
         composed_key: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cartridge / magazine / child-slot assembly
+// ---------------------------------------------------------------------------
+
+/// Diagnostic levels, one per `logger` method the ported C# calls.
+const DEBUG: &str = "debug";
+const WARNING: &str = "warning";
+const ERROR: &str = "error";
+
+/// The read-only views a generation run consults, plus the diagnostics it accumulates for the C#
+/// caller to replay through its logger.
+///
+/// Only the members the assembly functions below read live here; later tasks add the config values
+/// the generator itself needs.
+pub struct LootContext<'a> {
+    pub items_view: &'a HashMap<String, ItemView>,
+    pub static_ammo_dist: &'a HashMap<String, Vec<StaticAmmoDetails>>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// A fatal failure — the C# equivalent throws (`ItemHelperException`) or dereferences a null and
+/// crashes. Distinct from a [`Diagnostic`], which is logged while generation carries on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LootError {
+    pub message: String,
+}
+
+impl LootError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// A plain interpolated log line, the shape most of the ported call sites use.
+fn diagnostic(level: &str, message: String) -> Diagnostic {
+    Diagnostic {
+        level: level.to_owned(),
+        locale_key: None,
+        args: None,
+        message: Some(message),
+    }
+}
+
+/// C# types `Item.Location` as `object?`, and System.Text.Json writes a whole `double` as `3` where
+/// serde_json would write `3.0`. Every location this module produces is whole, so integral values go
+/// out as integers and the two serializers stay byte-identical.
+fn location_value(location: f64) -> serde_json::Value {
+    if location.is_finite() && location.fract() == 0.0 {
+        return serde_json::Value::from(location as i64);
+    }
+
+    serde_json::Value::from(location)
+}
+
+/// `ItemHelper.CreateCartridges` (`ItemHelper.cs:1502-1513`).
+pub fn create_cartridges(parent_id: &str, ammo_tpl: &str, stack_count: i32, location: f64) -> Item {
+    Item {
+        id: mongo_id::generate(),
+        template: ammo_tpl.to_owned(),
+        parent_id: Some(parent_id.to_owned()),
+        slot_id: Some("cartridges".to_owned()),
+        location: Some(location_value(location)),
+        upd: Some(Upd {
+            stack_objects_count: Some(f64::from(stack_count)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// `ItemHelper.AddCartridgesToAmmoBox` (`ItemHelper.cs:1241-1279`) — stacks of
+/// `min(boxMax, cartridgeMax)` whose locations count *down* to 0, and the one that lands on 0 goes
+/// out without a location at all, as live does it.
+///
+/// The `Err` cases are the two C# crash paths, reported rather than thrown so the caller can skip
+/// the box: a stack slot naming no cartridge (`ItemHelper.cs:1245` dereferences `cartridgeTpl!`),
+/// and an empty box list (`ItemHelper.cs:1266` indexes `ammoBox[0]`). A cartridge with no
+/// `StackMaxSize` joins them as a **deviation** — C# spins forever adding empty stacks, which is not
+/// something to reproduce behind an FFI boundary.
+pub fn add_cartridges_to_ammo_box(
+    ctx: &LootContext,
+    ammo_box: &mut Vec<Item>,
+    ammo_box_tpl: &str,
+) -> Result<(), Diagnostic> {
+    let ammo_box_details = get_item(ctx.items_view, ammo_box_tpl);
+    let ammo_box_max_cartridge_count =
+        ammo_box_details.and_then(|details| details.stack_slot_max_count);
+    let Some(cartridge_tpl) =
+        ammo_box_details.and_then(|details| details.stack_slot_first_filter_first.as_deref())
+    else {
+        return Err(diagnostic(
+            ERROR,
+            format!(
+                "Ammo box: {ammo_box_tpl} lacks a cartridge in its stack slot filter, unable to add cartridges"
+            ),
+        ));
+    };
+    let cartridge_max_stack_size =
+        get_item(ctx.items_view, cartridge_tpl).and_then(|details| details.stack_max_size);
+
+    // Exit early if ammo already exists in box
+    if ammo_box.iter().any(|item| item.template == cartridge_tpl) {
+        return Ok(());
+    }
+
+    let Some(ammo_box_max_cartridge_count) = ammo_box_max_cartridge_count else {
+        // `currentStoredCartridgeCount < null` is false in C#, so nothing is ever added.
+        return Ok(());
+    };
+
+    // Add new stack-size-correct items to ammo box
+    let max_per_stack =
+        ammo_box_max_cartridge_count.min(f64::from(cartridge_max_stack_size.unwrap_or(0)));
+    if ammo_box_max_cartridge_count > 0.0 && max_per_stack <= 0.0 {
+        return Err(diagnostic(
+            ERROR,
+            format!(
+                "Cartridge: {cartridge_tpl} of ammo box: {ammo_box_tpl} lacks a StackMaxSize, unable to add cartridges"
+            ),
+        ));
+    }
+
+    let mut current_stored_cartridge_count = 0.0;
+    // Find location based on Max ammo box size
+    let mut location = (ammo_box_max_cartridge_count / max_per_stack).ceil() - 1.0;
+
+    while current_stored_cartridge_count < ammo_box_max_cartridge_count {
+        let Some(parent_id) = ammo_box.first().map(|item| item.id.clone()) else {
+            return Err(diagnostic(
+                ERROR,
+                format!("Ammo box: {ammo_box_tpl} has no root item, unable to add cartridges"),
+            ));
+        };
+
+        let remaining_space = ammo_box_max_cartridge_count - current_stored_cartridge_count;
+        let cartridge_count_to_add = if remaining_space < max_per_stack {
+            remaining_space
+        } else {
+            max_per_stack
+        };
+
+        // Add cartridge item into items array
+        let mut cartridge_item_to_add = create_cartridges(
+            &parent_id,
+            cartridge_tpl,
+            cartridge_count_to_add as i32,
+            location,
+        );
+
+        // In live no ammo box has the first cartridge item with a location
+        if location == 0.0 {
+            cartridge_item_to_add.location = None;
+        }
+
+        ammo_box.push(cartridge_item_to_add);
+
+        current_stored_cartridge_count += cartridge_count_to_add;
+        location -= 1.0;
+    }
+
+    Ok(())
+}
+
+/// `ItemHelper.FillMagazineWithRandomCartridge` (`ItemHelper.cs:1291-1330`), with
+/// `GetRandomValidCaliber` and `DrawAmmoTpl` folded in as private helpers.
+pub fn fill_magazine_with_random_cartridge(
+    ctx: &mut LootContext,
+    magazine: &mut Vec<Item>,
+    mag_tpl: &str,
+    caliber: Option<&str>,
+    min_size_percent: f64,
+    default_cartridge_tpl: Option<&str>,
+    weapon_tpl: Option<&str>,
+) -> Result<(), LootError> {
+    let items_view = ctx.items_view;
+
+    let resolved_caliber = match caliber {
+        Some(caliber) => caliber.to_owned(),
+        None => get_random_valid_caliber(items_view, mag_tpl)?,
+    };
+    // Edge case - Klin pp-9 has a typo in its ammo caliber
+    let chosen_caliber = if resolved_caliber == "Caliber9x18PMM" {
+        "Caliber9x18PM"
+    } else {
+        resolved_caliber.as_str()
+    };
+
+    // A weapon's chamber, when one is passed in, is a whitelist for the draw.
+    let cartridge_whitelist = weapon_tpl
+        .and_then(|weapon_tpl| get_item(items_view, weapon_tpl))
+        .and_then(|weapon| weapon.chambers_first_filter.as_deref());
+
+    // Chose a randomly weighted cartridge that fits
+    let Some(cartridge_tpl) = draw_ammo_tpl(
+        ctx,
+        chosen_caliber,
+        default_cartridge_tpl,
+        cartridge_whitelist,
+    )?
+    else {
+        let magazine_id = magazine.first().map_or("", |item| item.id.as_str());
+        ctx.diagnostics.push(diagnostic(
+            DEBUG,
+            format!("Unable to fill item: {magazine_id} {mag_tpl} with cartridges, none found."),
+        ));
+
+        return Ok(());
+    };
+
+    fill_magazine_with_cartridge(ctx, magazine, mag_tpl, &cartridge_tpl, min_size_percent)
+}
+
+/// `ItemHelper.FillMagazineWithCartridge` (`ItemHelper.cs:1339-1418`) — stacks ascend from location
+/// 0, and a magazine that ends up with a single stack has that location removed again.
+///
+/// The `Err` case is the C# crash at `ItemHelper.cs:1409`: a cartridge with no `StackMaxSize` leaves
+/// `cartridgeCountToAdd` null and `+= cartridgeCountToAdd!.Value` throws. Like C#, that is only
+/// reached once the loop actually runs.
+pub fn fill_magazine_with_cartridge(
+    ctx: &mut LootContext,
+    magazine: &mut Vec<Item>,
+    mag_tpl: &str,
+    cartridge_tpl: &str,
+    min_size_multiplier: f64,
+) -> Result<(), LootError> {
+    let items_view = ctx.items_view;
+
+    // UBGL don't have mags
+    if is_of_baseclass(items_view, mag_tpl, LAUNCHER) {
+        return Ok(());
+    }
+
+    // Get cartridge properties and max allowed stack size
+    let cartridge_details = get_item(items_view, cartridge_tpl);
+    if cartridge_details.is_none() {
+        ctx.diagnostics.push(Diagnostic {
+            level: ERROR.to_owned(),
+            locale_key: Some("item-invalid_tpl_item".to_owned()),
+            args: Some(serde_json::Value::String(cartridge_tpl.to_owned())),
+            message: None,
+        });
+    }
+
+    let cartridge_max_stack_size = cartridge_details.and_then(|details| details.stack_max_size);
+    if cartridge_max_stack_size.is_none() {
+        ctx.diagnostics.push(diagnostic(
+            ERROR,
+            format!("Item with tpl: {cartridge_tpl} lacks a _props or StackMaxSize property"),
+        ));
+    }
+
+    // Get max number of cartridges in magazine, choose random value between min/max
+    let mag_details = get_item(items_view, mag_tpl);
+    let magazine_cartridge_max_count =
+        if is_of_baseclass(items_view, mag_tpl, SPRING_DRIVEN_CYLINDER) {
+            // Edge case for rotating grenade launcher magazine
+            mag_details
+                .and_then(|details| details.slots.as_ref())
+                .map(|slots| slots.len() as f64)
+        } else {
+            mag_details.and_then(|details| details.cartridges_max_count)
+        };
+
+    let Some(magazine_cartridge_max_count) = magazine_cartridge_max_count else {
+        ctx.diagnostics.push(diagnostic(
+            WARNING,
+            format!(
+                "Magazine: {mag_tpl} lacks a Cartridges array, unable to fill magazine with ammo"
+            ),
+        ));
+
+        return Ok(());
+    };
+
+    let desired_stack_count = random_util::get_int(
+        random_util::round_half_even(min_size_multiplier * magazine_cartridge_max_count) as i32,
+        magazine_cartridge_max_count as i32,
+    );
+
+    if magazine.len() > 1 {
+        ctx.diagnostics.push(diagnostic(
+            WARNING,
+            format!("Magazine {mag_tpl} already has cartridges defined,  this may cause issues"),
+        ));
+    }
+
+    // Loop over cartridge count and add stacks to magazine
+    let mut current_stored_cartridge_count = 0;
+    let mut location = 0;
+
+    while current_stored_cartridge_count < desired_stack_count {
+        let Some(cartridge_max_stack_size) = cartridge_max_stack_size else {
+            return Err(LootError::new(format!(
+                "Item with tpl: {cartridge_tpl} lacks a _props or StackMaxSize property"
+            )));
+        };
+        let Some(parent_id) = magazine.first().map(|item| item.id.clone()) else {
+            // C# indexes `magazineWithChildCartridges[0]` (`ItemHelper.cs:1406`) and throws.
+            return Err(LootError::new(format!(
+                "Magazine: {mag_tpl} has no root item, unable to fill it with cartridges"
+            )));
+        };
+
+        // Get stack size of cartridges
+        let mut cartridge_count_to_add = if desired_stack_count <= cartridge_max_stack_size {
+            desired_stack_count
+        } else {
+            cartridge_max_stack_size
+        };
+
+        // Ensure we don't go over the max stackCount size
+        let remaining_space = desired_stack_count - current_stored_cartridge_count;
+        if cartridge_count_to_add > remaining_space {
+            cartridge_count_to_add = remaining_space;
+        }
+
+        // Add cartridge item object into items array
+        magazine.push(create_cartridges(
+            &parent_id,
+            cartridge_tpl,
+            cartridge_count_to_add,
+            f64::from(location),
+        ));
+
+        current_stored_cartridge_count += cartridge_count_to_add;
+        location += 1;
+    }
+
+    // Only one cartridge stack added, remove location property as it's only used for 2 or more stacks
+    if location == 1 {
+        magazine[1].location = None;
+    }
+
+    Ok(())
+}
+
+/// `ItemHelper.AddChildSlotItems` (`ItemHelper.cs:1557-1636`), minus the `requiredOnly` flag no loot
+/// call site passes, with `GetCompatibleTplFromArray` (`ItemHelper.cs:1644-1653`) inlined.
+pub fn add_child_slot_items(
+    ctx: &mut LootContext,
+    item_to_add: Vec<Item>,
+    item_tpl: &str,
+    mod_spawn_chance_dict: Option<&HashMap<String, f64>>,
+) -> Vec<Item> {
+    let items_view = ctx.items_view;
+    let mut result = item_to_add;
+    let mut incompatible_mod_tpls: HashSet<&str> = HashSet::new();
+    // C# reads `result[0]` per slot and throws on an empty list; the root never moves, so it is read
+    // once here and an absent parent id stands in for the throw.
+    let root_id = result.first().map(|item| item.id.clone());
+
+    let slots = get_item(items_view, item_tpl)
+        .and_then(|item| item.slots.as_deref())
+        .unwrap_or_default();
+
+    for slot in slots {
+        let slot_name = slot.name.as_deref().unwrap_or_default();
+        let required = slot.required.unwrap_or(false);
+
+        // Roll chance for non-required slot mods
+        if let (Some(mod_spawn_chance_dict), false) = (mod_spawn_chance_dict, required) {
+            // only roll chance to not include mod if dict exists and has value for this mod type
+            // (e.g. front_plate)
+            if let Some(chance) = mod_spawn_chance_dict.get(&slot_name.to_lowercase())
+                && !random_util::get_chance_100(*chance)
+            {
+                continue;
+            }
+        }
+
+        let item_pool = slot.filter.as_deref().unwrap_or_default();
+        if item_pool.is_empty() {
+            ctx.diagnostics.push(diagnostic(
+                DEBUG,
+                format!("Unable to choose a mod for slot: {slot_name} on item: {item_tpl}, parents' 'Filter' array is empty, skipping"),
+            ));
+
+            continue;
+        }
+
+        let compatible_tpls: Vec<&String> = item_pool
+            .iter()
+            .filter(|tpl| !incompatible_mod_tpls.contains(tpl.as_str()))
+            .collect();
+        if compatible_tpls.is_empty() {
+            ctx.diagnostics.push(diagnostic(
+                DEBUG,
+                format!(
+                    "Unable to choose a mod for slot: {slot_name} on item: {item_tpl}, no compatible tpl found in pool of {}, skipping",
+                    item_pool.len()
+                ),
+            ));
+
+            continue;
+        }
+
+        let chosen_tpl = *random_util::get_array_value(&compatible_tpls);
+
+        // Create basic item structure ready to add to weapon array
+        result.push(Item {
+            id: mongo_id::generate(),
+            template: chosen_tpl.clone(),
+            parent_id: root_id.clone(),
+            slot_id: slot.name.clone(),
+            ..Default::default()
+        });
+
+        // Include conflicting items of newly added mod in pool to be used for next mod choice
+        if let Some(conflicting_items) = get_item(items_view, chosen_tpl)
+            .and_then(|details| details.conflicting_items.as_deref())
+        {
+            incompatible_mod_tpls.extend(conflicting_items.iter().map(String::as_str));
+        }
+    }
+
+    result
+}
+
+/// `ItemHelper.GetRandomValidCaliber` (`ItemHelper.cs:1425-1436`). Both of its throw paths — a
+/// magazine with no cartridge filter, and a drawn caliber that is null (either an empty list, which
+/// makes `DrawRandomFromList` index `RandInt(0)`, or an item with no `Caliber`) — come back as
+/// [`LootError`] with the C# message.
+fn get_random_valid_caliber(
+    items_view: &HashMap<String, ItemView>,
+    mag_tpl: &str,
+) -> Result<String, LootError> {
+    let Some(ammo_tpls) = get_item(items_view, mag_tpl)
+        .and_then(|mag_template| mag_template.cartridges_first_filter.as_deref())
+    else {
+        return Err(LootError::new(
+            "Calibers is null when trying to generate random valid caliber",
+        ));
+    };
+
+    let calibers: Vec<Option<&String>> = ammo_tpls
+        .iter()
+        .filter_map(|ammo_tpl| get_item(items_view, ammo_tpl))
+        .map(|ammo| ammo.caliber.as_ref())
+        .collect();
+
+    let chosen_caliber = if calibers.is_empty() {
+        None
+    } else {
+        *random_util::get_array_value(&calibers)
+    };
+
+    chosen_caliber.cloned().ok_or_else(|| {
+        LootError::new(format!(
+            "Chosen caliber is null when trying to fill magazine with random cartridge (magazine: {mag_tpl})"
+        ))
+    })
+}
+
+/// `ItemHelper.DrawAmmoTpl` (`ItemHelper.cs:1446-1492`) — a weighted draw over the caliber's pool,
+/// filtered by the weapon chamber whitelist when one is supplied.
+///
+/// The `Err` case is the C# crash at `ItemHelper.cs:1487`, which casts `RelativeProbability!.Value`.
+fn draw_ammo_tpl(
+    ctx: &mut LootContext,
+    caliber: &str,
+    fallback_cartridge_tpl: Option<&str>,
+    cartridge_whitelist: Option<&[String]>,
+) -> Result<Option<String>, LootError> {
+    let ammos = ctx
+        .static_ammo_dist
+        .get(caliber)
+        .map_or_else(|| [].as_slice(), Vec::as_slice);
+
+    if ammos.is_empty() {
+        if let Some(fallback_cartridge_tpl) = fallback_cartridge_tpl {
+            ctx.diagnostics.push(diagnostic(
+                WARNING,
+                format!("Unable to pick a cartridge for caliber: {caliber}, staticAmmoDist has no data. using fallback value of {fallback_cartridge_tpl}"),
+            ));
+
+            return Ok(Some(fallback_cartridge_tpl.to_owned()));
+        }
+
+        ctx.diagnostics.push(diagnostic(
+            WARNING,
+            format!("Unable to pick a cartridge for caliber: {caliber}, staticAmmoDist has no data. No fallback value provided"),
+        ));
+
+        return Ok(None);
+    }
+
+    let mut ammo_array: ProbabilityObjectArray<String, ()> = ProbabilityObjectArray::new();
+    for ammo_details in ammos {
+        let Some(tpl) = ammo_details.tpl.as_deref() else {
+            ctx.diagnostics.push(diagnostic(
+                ERROR,
+                "Ammo details tpl is null when trying to draw ammo from pool".to_owned(),
+            ));
+
+            continue;
+        };
+
+        // Whitelist exists and tpl not inside it, skip. Fixes 9x18mm kedr issues
+        if cartridge_whitelist
+            .is_some_and(|whitelist| !whitelist.iter().any(|allowed| allowed == tpl))
+        {
+            continue;
+        }
+
+        let Some(relative_probability) = ammo_details.relative_probability else {
+            return Err(LootError::new(format!(
+                "Ammo: {tpl} of caliber: {caliber} lacks a relativeProbability"
+            )));
+        };
+
+        ammo_array.add(ProbabilityObject {
+            key: tpl.to_owned(),
+            relative_probability,
+            data: None,
+        });
+    }
+
+    Ok(ammo_array.draw(1).into_iter().next())
 }
 
 #[cfg(test)]
@@ -613,5 +1136,800 @@ mod tests {
         assert_eq!(out["upd"]["StackObjectsCount"], 2.0);
         assert_eq!(out["modAddedField"], "kept");
         assert!(out.as_object().unwrap().get("composedKey").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cartridge / magazine / child-slot assembly
+    // -----------------------------------------------------------------------
+
+    const CALIBER: &str = "Caliber762x39";
+    const CARTRIDGE_A_TPL: &str = "aaaaaaaaaaaaaaaaaaaaaaaa";
+    const CARTRIDGE_B_TPL: &str = "bbbbbbbbbbbbbbbbbbbbbbbb";
+    /// No `StackMaxSize`, the property the fill loops crash on in C#.
+    const CARTRIDGE_NO_STACK_TPL: &str = "cccccccccccccccccccccccc";
+    /// No `Caliber`, so it draws a null out of the magazine's filter.
+    const CARTRIDGE_NO_CALIBER_TPL: &str = "dddddddddddddddddddddddd";
+    const AMMO_BOX_TPL: &str = "a0a0a0a0a0a0a0a0a0a0a0a0";
+    const AMMO_BOX_REMAINDER_TPL: &str = "a1a1a1a1a1a1a1a1a1a1a1a1";
+    const AMMO_BOX_SINGLE_TPL: &str = "a2a2a2a2a2a2a2a2a2a2a2a2";
+    const AMMO_BOX_NO_FILTER_TPL: &str = "a3a3a3a3a3a3a3a3a3a3a3a3";
+    const AMMO_BOX_NO_STACK_SIZE_TPL: &str = "a4a4a4a4a4a4a4a4a4a4a4a4";
+    const MAGAZINE_TPL: &str = "b0b0b0b0b0b0b0b0b0b0b0b0";
+    const MAGAZINE_SMALL_TPL: &str = "b1b1b1b1b1b1b1b1b1b1b1b1";
+    const MAGAZINE_NO_CARTRIDGES_TPL: &str = "b2b2b2b2b2b2b2b2b2b2b2b2";
+    const MAGAZINE_NO_CALIBER_TPL: &str = "b3b3b3b3b3b3b3b3b3b3b3b3";
+    const UBGL_TPL: &str = "b4b4b4b4b4b4b4b4b4b4b4b4";
+    const CYLINDER_TPL: &str = "b5b5b5b5b5b5b5b5b5b5b5b5";
+    const WEAPON_TPL: &str = "c0c0c0c0c0c0c0c0c0c0c0c0";
+    const MOD_A_TPL: &str = "d0d0d0d0d0d0d0d0d0d0d0d0";
+    const MOD_B_TPL: &str = "d1d1d1d1d1d1d1d1d1d1d1d1";
+    const MOD_C_TPL: &str = "d2d2d2d2d2d2d2d2d2d2d2d2";
+    const ITEM_WITH_SLOTS_TPL: &str = "e0e0e0e0e0e0e0e0e0e0e0e0";
+    const ITEM_CONFLICT_TPL: &str = "e1e1e1e1e1e1e1e1e1e1e1e1";
+    const ITEM_CONFLICT_DEAD_TPL: &str = "e2e2e2e2e2e2e2e2e2e2e2e2";
+
+    fn ammo_fixture() -> HashMap<String, ItemView> {
+        serde_json::from_value(json!({
+            ITEM_NODE: {},
+            AMMO_BOX: { "parent": ITEM_NODE },
+            MAGAZINE: { "parent": ITEM_NODE },
+            LAUNCHER: { "parent": ITEM_NODE },
+            SPRING_DRIVEN_CYLINDER: { "parent": MAGAZINE },
+            WEAPON: { "parent": ITEM_NODE },
+
+            CARTRIDGE_A_TPL: { "parent": ITEM_NODE, "stackMaxSize": 30, "caliber": CALIBER },
+            CARTRIDGE_B_TPL: { "parent": ITEM_NODE, "stackMaxSize": 60, "caliber": CALIBER },
+            CARTRIDGE_NO_STACK_TPL: { "parent": ITEM_NODE, "caliber": CALIBER },
+            CARTRIDGE_NO_CALIBER_TPL: { "parent": ITEM_NODE, "stackMaxSize": 60 },
+
+            // 90 / 30 = 3 stacks, so locations count down 2, 1, 0.
+            AMMO_BOX_TPL: {
+                "parent": AMMO_BOX, "stackSlotMaxCount": 90,
+                "stackSlotFirstFilterFirst": CARTRIDGE_A_TPL
+            },
+            // 50 / 30 = a full stack then a 20-cartridge remainder.
+            AMMO_BOX_REMAINDER_TPL: {
+                "parent": AMMO_BOX, "stackSlotMaxCount": 50,
+                "stackSlotFirstFilterFirst": CARTRIDGE_A_TPL
+            },
+            AMMO_BOX_SINGLE_TPL: {
+                "parent": AMMO_BOX, "stackSlotMaxCount": 30,
+                "stackSlotFirstFilterFirst": CARTRIDGE_A_TPL
+            },
+            AMMO_BOX_NO_FILTER_TPL: { "parent": AMMO_BOX, "stackSlotMaxCount": 60 },
+            AMMO_BOX_NO_STACK_SIZE_TPL: {
+                "parent": AMMO_BOX, "stackSlotMaxCount": 60,
+                "stackSlotFirstFilterFirst": CARTRIDGE_NO_STACK_TPL
+            },
+
+            MAGAZINE_TPL: {
+                "parent": MAGAZINE, "cartridgesMaxCount": 60,
+                "cartridgesFirstFilter": [CARTRIDGE_A_TPL]
+            },
+            MAGAZINE_SMALL_TPL: {
+                "parent": MAGAZINE, "cartridgesMaxCount": 5,
+                "cartridgesFirstFilter": [CARTRIDGE_B_TPL]
+            },
+            MAGAZINE_NO_CARTRIDGES_TPL: { "parent": MAGAZINE },
+            MAGAZINE_NO_CALIBER_TPL: {
+                "parent": MAGAZINE, "cartridgesMaxCount": 60,
+                "cartridgesFirstFilter": [CARTRIDGE_NO_CALIBER_TPL]
+            },
+            UBGL_TPL: { "parent": LAUNCHER, "cartridgesMaxCount": 60 },
+            // Rotating grenade launcher magazine: capacity is the slot count, not a Cartridges entry.
+            CYLINDER_TPL: {
+                "parent": SPRING_DRIVEN_CYLINDER,
+                "slots": [
+                    { "name": "mod_1" }, { "name": "mod_2" }, { "name": "mod_3" },
+                    { "name": "mod_4" }, { "name": "mod_5" }, { "name": "mod_6" }
+                ]
+            },
+
+            WEAPON_TPL: { "parent": WEAPON, "chambersFirstFilter": [CARTRIDGE_B_TPL] },
+
+            MOD_A_TPL: { "parent": ITEM_NODE, "conflictingItems": [MOD_B_TPL] },
+            MOD_B_TPL: { "parent": ITEM_NODE },
+            MOD_C_TPL: { "parent": ITEM_NODE },
+
+            ITEM_WITH_SLOTS_TPL: {
+                "parent": ITEM_NODE,
+                "slots": [
+                    { "name": "mod_required", "required": true, "filter": [MOD_C_TPL] },
+                    { "name": "Mod_Scope", "required": false, "filter": [MOD_C_TPL] },
+                    { "name": "mod_other", "required": false, "filter": [MOD_C_TPL] },
+                    { "name": "mod_empty", "required": false, "filter": [] }
+                ]
+            },
+            ITEM_CONFLICT_TPL: {
+                "parent": ITEM_NODE,
+                "slots": [
+                    { "name": "slot_one", "required": true, "filter": [MOD_A_TPL] },
+                    { "name": "slot_two", "required": true, "filter": [MOD_B_TPL, MOD_C_TPL] }
+                ]
+            },
+            ITEM_CONFLICT_DEAD_TPL: {
+                "parent": ITEM_NODE,
+                "slots": [
+                    { "name": "slot_one", "required": true, "filter": [MOD_A_TPL] },
+                    { "name": "slot_two", "required": true, "filter": [MOD_B_TPL] }
+                ]
+            },
+        }))
+        .unwrap()
+    }
+
+    fn ammo_dist(value: serde_json::Value) -> HashMap<String, Vec<StaticAmmoDetails>> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn no_ammo_dist() -> HashMap<String, Vec<StaticAmmoDetails>> {
+        HashMap::new()
+    }
+
+    fn context<'a>(
+        items_view: &'a HashMap<String, ItemView>,
+        static_ammo_dist: &'a HashMap<String, Vec<StaticAmmoDetails>>,
+    ) -> LootContext<'a> {
+        LootContext {
+            items_view,
+            static_ammo_dist,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn root(template: &str) -> Vec<Item> {
+        vec![Item {
+            id: mongo_id::generate(),
+            template: template.to_owned(),
+            ..Default::default()
+        }]
+    }
+
+    fn location_of(item: &Item) -> Option<i64> {
+        item.location.as_ref().and_then(serde_json::Value::as_i64)
+    }
+
+    fn stack_count_of(item: &Item) -> Option<f64> {
+        item.upd.as_ref().and_then(|upd| upd.stack_objects_count)
+    }
+
+    fn levels<'a>(ctx: &'a LootContext<'a>) -> Vec<&'a str> {
+        ctx.diagnostics
+            .iter()
+            .map(|entry| entry.level.as_str())
+            .collect()
+    }
+
+    fn messages(ctx: &LootContext) -> String {
+        ctx.diagnostics
+            .iter()
+            .filter_map(|entry| entry.message.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn create_cartridges_builds_a_cartridges_slot_child() {
+        let cartridge = create_cartridges("parent-id", CARTRIDGE_A_TPL, 27, 2.0);
+
+        assert_eq!(cartridge.id.len(), 24);
+        assert_eq!(cartridge.template, CARTRIDGE_A_TPL);
+        assert_eq!(cartridge.parent_id.as_deref(), Some("parent-id"));
+        assert_eq!(cartridge.slot_id.as_deref(), Some("cartridges"));
+        assert_eq!(location_of(&cartridge), Some(2));
+        assert_eq!(stack_count_of(&cartridge), Some(27.0));
+        // C# writes `Location` through `object?`, so a whole double lands on the wire as an integer.
+        let out = serde_json::to_value(&cartridge).unwrap();
+        assert_eq!(out["location"], json!(2));
+        assert_eq!(out["upd"]["StackObjectsCount"], json!(27.0));
+    }
+
+    #[test]
+    fn add_cartridges_to_ammo_box_counts_locations_down_and_nulls_the_last() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let ctx = context(&view, &dist);
+        let mut ammo_box = root(AMMO_BOX_TPL);
+
+        add_cartridges_to_ammo_box(&ctx, &mut ammo_box, AMMO_BOX_TPL).unwrap();
+
+        // 90 capacity / 30 per stack -> three stacks, locations 2, 1, then absent.
+        assert_eq!(ammo_box.len(), 4);
+        assert_eq!(
+            ammo_box[1..].iter().map(location_of).collect::<Vec<_>>(),
+            vec![Some(2), Some(1), None]
+        );
+        for cartridge in &ammo_box[1..] {
+            assert_eq!(cartridge.template, CARTRIDGE_A_TPL);
+            assert_eq!(stack_count_of(cartridge), Some(30.0));
+            assert_eq!(cartridge.slot_id.as_deref(), Some("cartridges"));
+            assert_eq!(cartridge.parent_id.as_ref(), Some(&ammo_box[0].id));
+        }
+    }
+
+    #[test]
+    fn add_cartridges_to_ammo_box_trims_the_final_stack_to_the_remaining_space() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let ctx = context(&view, &dist);
+        let mut ammo_box = root(AMMO_BOX_REMAINDER_TPL);
+
+        add_cartridges_to_ammo_box(&ctx, &mut ammo_box, AMMO_BOX_REMAINDER_TPL).unwrap();
+
+        assert_eq!(ammo_box.len(), 3);
+        assert_eq!(stack_count_of(&ammo_box[1]), Some(30.0));
+        assert_eq!(location_of(&ammo_box[1]), Some(1));
+        assert_eq!(stack_count_of(&ammo_box[2]), Some(20.0));
+        assert_eq!(location_of(&ammo_box[2]), None);
+    }
+
+    #[test]
+    fn add_cartridges_to_ammo_box_leaves_a_lone_stack_without_a_location() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let ctx = context(&view, &dist);
+        let mut ammo_box = root(AMMO_BOX_SINGLE_TPL);
+
+        add_cartridges_to_ammo_box(&ctx, &mut ammo_box, AMMO_BOX_SINGLE_TPL).unwrap();
+
+        assert_eq!(ammo_box.len(), 2);
+        assert_eq!(stack_count_of(&ammo_box[1]), Some(30.0));
+        assert!(ammo_box[1].location.is_none());
+    }
+
+    #[test]
+    fn add_cartridges_to_ammo_box_is_a_no_op_when_the_cartridge_is_already_there() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let ctx = context(&view, &dist);
+        let mut ammo_box = root(AMMO_BOX_TPL);
+        ammo_box.push(Item {
+            id: mongo_id::generate(),
+            template: CARTRIDGE_A_TPL.to_owned(),
+            ..Default::default()
+        });
+
+        add_cartridges_to_ammo_box(&ctx, &mut ammo_box, AMMO_BOX_TPL).unwrap();
+
+        assert_eq!(ammo_box.len(), 2);
+    }
+
+    #[test]
+    fn add_cartridges_to_ammo_box_errors_when_the_box_names_no_cartridge() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let ctx = context(&view, &dist);
+        let mut ammo_box = root(AMMO_BOX_NO_FILTER_TPL);
+
+        // C# dereferences `cartridgeTpl!.Value` here and throws.
+        let error =
+            add_cartridges_to_ammo_box(&ctx, &mut ammo_box, AMMO_BOX_NO_FILTER_TPL).unwrap_err();
+
+        assert_eq!(error.level, ERROR);
+        assert_eq!(ammo_box.len(), 1);
+    }
+
+    #[test]
+    fn add_cartridges_to_ammo_box_errors_instead_of_spinning_on_a_zero_stack_size() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let ctx = context(&view, &dist);
+        let mut ammo_box = root(AMMO_BOX_NO_STACK_SIZE_TPL);
+
+        // Deviation: `maxPerStack` of 0 makes the C# `while` loop add empty stacks forever.
+        let error = add_cartridges_to_ammo_box(&ctx, &mut ammo_box, AMMO_BOX_NO_STACK_SIZE_TPL)
+            .unwrap_err();
+
+        assert_eq!(error.level, ERROR);
+        assert_eq!(ammo_box.len(), 1);
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_leaves_launchers_alone() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(UBGL_TPL);
+
+        fill_magazine_with_cartridge(&mut ctx, &mut magazine, UBGL_TPL, CARTRIDGE_A_TPL, 1.0)
+            .unwrap();
+
+        assert_eq!(magazine.len(), 1);
+        assert!(ctx.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_stacks_ascend_from_location_zero() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        // A multiplier of 1 pins the desired count to the magazine's 60, so 30-round stacks fill it.
+        fill_magazine_with_cartridge(&mut ctx, &mut magazine, MAGAZINE_TPL, CARTRIDGE_A_TPL, 1.0)
+            .unwrap();
+
+        assert_eq!(magazine.len(), 3);
+        assert_eq!(location_of(&magazine[1]), Some(0));
+        assert_eq!(location_of(&magazine[2]), Some(1));
+        assert_eq!(stack_count_of(&magazine[1]), Some(30.0));
+        assert_eq!(stack_count_of(&magazine[2]), Some(30.0));
+        assert_eq!(magazine[1].parent_id.as_ref(), Some(&magazine[0].id));
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_drops_the_location_of_a_lone_stack() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        // A 60-round stack size swallows the whole 60-round magazine in one go.
+        fill_magazine_with_cartridge(&mut ctx, &mut magazine, MAGAZINE_TPL, CARTRIDGE_B_TPL, 1.0)
+            .unwrap();
+
+        assert_eq!(magazine.len(), 2);
+        assert_eq!(stack_count_of(&magazine[1]), Some(60.0));
+        assert!(magazine[1].location.is_none());
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_takes_a_cylinders_capacity_from_its_slot_count() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(CYLINDER_TPL);
+
+        fill_magazine_with_cartridge(&mut ctx, &mut magazine, CYLINDER_TPL, CARTRIDGE_B_TPL, 1.0)
+            .unwrap();
+
+        // Six slots, no Cartridges entry at all.
+        assert_eq!(magazine.len(), 2);
+        assert_eq!(stack_count_of(&magazine[1]), Some(6.0));
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_warns_when_the_magazine_has_no_cartridges_array() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_NO_CARTRIDGES_TPL);
+
+        fill_magazine_with_cartridge(
+            &mut ctx,
+            &mut magazine,
+            MAGAZINE_NO_CARTRIDGES_TPL,
+            CARTRIDGE_A_TPL,
+            1.0,
+        )
+        .unwrap();
+
+        assert_eq!(magazine.len(), 1);
+        assert_eq!(levels(&ctx), vec![WARNING]);
+        assert!(messages(&ctx).contains("lacks a Cartridges array"));
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_errors_when_the_cartridge_has_no_stack_max_size() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        // C# adds `cartridgeCountToAdd!.Value` on a null and crashes.
+        let error = fill_magazine_with_cartridge(
+            &mut ctx,
+            &mut magazine,
+            MAGAZINE_TPL,
+            CARTRIDGE_NO_STACK_TPL,
+            1.0,
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("StackMaxSize"));
+        assert_eq!(levels(&ctx), vec![ERROR]);
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_reports_an_unknown_cartridge_tpl_by_locale_key() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        let unknown = "999999999999999999999999";
+        fill_magazine_with_cartridge(&mut ctx, &mut magazine, MAGAZINE_TPL, unknown, 1.0)
+            .unwrap_err();
+
+        assert_eq!(levels(&ctx), vec![ERROR, ERROR]);
+        assert_eq!(
+            ctx.diagnostics[0].locale_key.as_deref(),
+            Some("item-invalid_tpl_item")
+        );
+        assert_eq!(ctx.diagnostics[0].args, Some(json!(unknown)));
+        assert!(ctx.diagnostics[0].message.is_none());
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_draws_between_the_banker_rounded_minimum_and_the_max() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut counts = HashSet::new();
+
+        for _ in 0..500 {
+            let mut ctx = context(&view, &dist);
+            let mut magazine = root(MAGAZINE_SMALL_TPL);
+
+            // 0.5 * 5 = 2.5, which banker's rounding takes to 2 — away-from-zero would say 3.
+            fill_magazine_with_cartridge(
+                &mut ctx,
+                &mut magazine,
+                MAGAZINE_SMALL_TPL,
+                CARTRIDGE_B_TPL,
+                0.5,
+            )
+            .unwrap();
+
+            counts.insert(stack_count_of(&magazine[1]).unwrap() as i32);
+        }
+
+        assert_eq!(counts, HashSet::from([2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn fill_magazine_with_cartridge_warns_when_the_magazine_already_has_children() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+        magazine.push(Item {
+            id: mongo_id::generate(),
+            template: MOD_C_TPL.to_owned(),
+            location: Some(json!(7)),
+            ..Default::default()
+        });
+
+        fill_magazine_with_cartridge(&mut ctx, &mut magazine, MAGAZINE_TPL, CARTRIDGE_B_TPL, 1.0)
+            .unwrap();
+
+        assert_eq!(levels(&ctx), vec![WARNING]);
+        assert!(messages(&ctx).contains("already has cartridges defined"));
+        // Bug-compatible: the "one stack only" cleanup blanks index 1 whatever it happens to be.
+        assert!(magazine[1].location.is_none());
+        assert_eq!(magazine[1].template, MOD_C_TPL);
+    }
+
+    #[test]
+    fn fill_magazine_with_random_cartridge_picks_a_caliber_from_the_magazines_filter() {
+        let view = ammo_fixture();
+        let dist = ammo_dist(json!({
+            CALIBER: [{ "tpl": CARTRIDGE_A_TPL, "relativeProbability": 1 }],
+        }));
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        fill_magazine_with_random_cartridge(
+            &mut ctx,
+            &mut magazine,
+            MAGAZINE_TPL,
+            None,
+            1.0,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(magazine.len(), 3);
+        assert!(
+            magazine[1..]
+                .iter()
+                .all(|item| item.template == CARTRIDGE_A_TPL)
+        );
+        assert!(ctx.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn fill_magazine_with_random_cartridge_fixes_the_klin_caliber_typo() {
+        let view = ammo_fixture();
+        let dist = ammo_dist(json!({
+            "Caliber9x18PM": [{ "tpl": CARTRIDGE_B_TPL, "relativeProbability": 1 }],
+        }));
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        fill_magazine_with_random_cartridge(
+            &mut ctx,
+            &mut magazine,
+            MAGAZINE_TPL,
+            Some("Caliber9x18PMM"),
+            1.0,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(magazine.len(), 2);
+        assert_eq!(magazine[1].template, CARTRIDGE_B_TPL);
+    }
+
+    #[test]
+    fn fill_magazine_with_random_cartridge_honours_the_weapon_chamber_whitelist() {
+        let view = ammo_fixture();
+        let dist = ammo_dist(json!({
+            CALIBER: [
+                { "tpl": CARTRIDGE_A_TPL, "relativeProbability": 100 },
+                { "tpl": CARTRIDGE_B_TPL, "relativeProbability": 1 },
+            ],
+        }));
+
+        // The chamber only admits B, so the far heavier A must never come out.
+        for _ in 0..50 {
+            let mut ctx = context(&view, &dist);
+            let mut magazine = root(MAGAZINE_TPL);
+
+            fill_magazine_with_random_cartridge(
+                &mut ctx,
+                &mut magazine,
+                MAGAZINE_TPL,
+                Some(CALIBER),
+                1.0,
+                None,
+                Some(WEAPON_TPL),
+            )
+            .unwrap();
+
+            assert_eq!(magazine[1].template, CARTRIDGE_B_TPL);
+        }
+    }
+
+    #[test]
+    fn fill_magazine_with_random_cartridge_falls_back_when_the_pool_is_empty() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        fill_magazine_with_random_cartridge(
+            &mut ctx,
+            &mut magazine,
+            MAGAZINE_TPL,
+            Some(CALIBER),
+            1.0,
+            Some(CARTRIDGE_B_TPL),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(magazine.len(), 2);
+        assert_eq!(magazine[1].template, CARTRIDGE_B_TPL);
+        assert_eq!(levels(&ctx), vec![WARNING]);
+        assert!(messages(&ctx).contains("using fallback value of"));
+    }
+
+    #[test]
+    fn fill_magazine_with_random_cartridge_gives_up_without_a_pool_or_a_fallback() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        fill_magazine_with_random_cartridge(
+            &mut ctx,
+            &mut magazine,
+            MAGAZINE_TPL,
+            Some(CALIBER),
+            1.0,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(magazine.len(), 1);
+        assert_eq!(levels(&ctx), vec![WARNING, DEBUG]);
+        assert!(messages(&ctx).contains("No fallback value provided"));
+        assert!(messages(&ctx).contains("with cartridges, none found."));
+    }
+
+    #[test]
+    fn fill_magazine_with_random_cartridge_errors_when_no_caliber_resolves() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+
+        // No cartridge filter at all — C# throws "Calibers is null".
+        let error = fill_magazine_with_random_cartridge(
+            &mut ctx,
+            &mut root(MAGAZINE_NO_CARTRIDGES_TPL),
+            MAGAZINE_NO_CARTRIDGES_TPL,
+            None,
+            1.0,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("Calibers is null"));
+
+        // A filter whose only cartridge has no Caliber draws a null — C# throws "Chosen caliber".
+        let error = fill_magazine_with_random_cartridge(
+            &mut ctx,
+            &mut root(MAGAZINE_NO_CALIBER_TPL),
+            MAGAZINE_NO_CALIBER_TPL,
+            None,
+            1.0,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("Chosen caliber is null"));
+    }
+
+    #[test]
+    fn fill_magazine_with_random_cartridge_skips_ammo_entries_without_a_tpl() {
+        let view = ammo_fixture();
+        let dist = ammo_dist(json!({
+            CALIBER: [
+                { "relativeProbability": 100 },
+                { "tpl": CARTRIDGE_B_TPL, "relativeProbability": 1 },
+            ],
+        }));
+        let mut ctx = context(&view, &dist);
+        let mut magazine = root(MAGAZINE_TPL);
+
+        fill_magazine_with_random_cartridge(
+            &mut ctx,
+            &mut magazine,
+            MAGAZINE_TPL,
+            Some(CALIBER),
+            1.0,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(magazine[1].template, CARTRIDGE_B_TPL);
+        assert_eq!(levels(&ctx), vec![ERROR]);
+        assert!(messages(&ctx).contains("Ammo details tpl is null"));
+    }
+
+    #[test]
+    fn fill_magazine_with_random_cartridge_errors_on_an_ammo_entry_without_a_probability() {
+        let view = ammo_fixture();
+        let dist = ammo_dist(json!({ CALIBER: [{ "tpl": CARTRIDGE_B_TPL }] }));
+        let mut ctx = context(&view, &dist);
+
+        // C# casts `RelativeProbability!.Value` and crashes.
+        let error = fill_magazine_with_random_cartridge(
+            &mut ctx,
+            &mut root(MAGAZINE_TPL),
+            MAGAZINE_TPL,
+            Some(CALIBER),
+            1.0,
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("relativeProbability"));
+    }
+
+    #[test]
+    fn add_child_slot_items_fills_every_slot_when_no_chance_dict_is_given() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+
+        let result = add_child_slot_items(
+            &mut ctx,
+            root(ITEM_WITH_SLOTS_TPL),
+            ITEM_WITH_SLOTS_TPL,
+            None,
+        );
+
+        // Three filled slots; the empty-filter slot is skipped with a debug line.
+        assert_eq!(result.len(), 4);
+        assert_eq!(
+            result[1..]
+                .iter()
+                .map(|item| item.slot_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["mod_required", "Mod_Scope", "mod_other"]
+        );
+        for child in &result[1..] {
+            assert_eq!(child.template, MOD_C_TPL);
+            assert_eq!(child.id.len(), 24);
+            assert_eq!(child.parent_id.as_ref(), Some(&result[0].id));
+        }
+        assert_eq!(levels(&ctx), vec![DEBUG]);
+        assert!(messages(&ctx).contains("'Filter' array is empty"));
+    }
+
+    #[test]
+    fn add_child_slot_items_never_rolls_for_required_slots() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let chances = HashMap::from([
+            ("mod_required".to_owned(), 0.0),
+            ("mod_scope".to_owned(), 0.0),
+            ("mod_other".to_owned(), 0.0),
+        ]);
+
+        for _ in 0..50 {
+            let mut ctx = context(&view, &dist);
+
+            let result = add_child_slot_items(
+                &mut ctx,
+                root(ITEM_WITH_SLOTS_TPL),
+                ITEM_WITH_SLOTS_TPL,
+                Some(&chances),
+            );
+
+            // A 0% chance never fires, so only the required slot survives.
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[1].slot_id.as_deref(), Some("mod_required"));
+        }
+    }
+
+    #[test]
+    fn add_child_slot_items_only_rolls_for_slots_the_dict_names_lowercased() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        // "Mod_Scope" is looked up lowercased; "mod_other" has no entry, so it is never rolled.
+        let chances = HashMap::from([("mod_scope".to_owned(), 0.0)]);
+
+        for _ in 0..50 {
+            let mut ctx = context(&view, &dist);
+
+            let result = add_child_slot_items(
+                &mut ctx,
+                root(ITEM_WITH_SLOTS_TPL),
+                ITEM_WITH_SLOTS_TPL,
+                Some(&chances),
+            );
+
+            assert_eq!(
+                result[1..]
+                    .iter()
+                    .map(|item| item.slot_id.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["mod_required", "mod_other"]
+            );
+        }
+    }
+
+    #[test]
+    fn add_child_slot_items_excludes_conflicts_of_already_chosen_mods() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+
+        for _ in 0..50 {
+            let mut ctx = context(&view, &dist);
+
+            let result =
+                add_child_slot_items(&mut ctx, root(ITEM_CONFLICT_TPL), ITEM_CONFLICT_TPL, None);
+
+            // MOD_A conflicts with MOD_B, so slot two can only ever land on MOD_C.
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[1].template, MOD_A_TPL);
+            assert_eq!(result[2].template, MOD_C_TPL);
+        }
+    }
+
+    #[test]
+    fn add_child_slot_items_skips_a_slot_whose_whole_pool_conflicts() {
+        let view = ammo_fixture();
+        let dist = no_ammo_dist();
+        let mut ctx = context(&view, &dist);
+
+        let result = add_child_slot_items(
+            &mut ctx,
+            root(ITEM_CONFLICT_DEAD_TPL),
+            ITEM_CONFLICT_DEAD_TPL,
+            None,
+        );
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1].template, MOD_A_TPL);
+        assert_eq!(levels(&ctx), vec![DEBUG]);
+        assert!(messages(&ctx).contains("no compatible tpl found in pool of 1"));
     }
 }
