@@ -304,8 +304,67 @@ public record StaticContainersRequest : LootCommon
 
 public record DynamicLootRequest : LootCommon
 {
+    /// <summary>
+    /// Either a <see cref="Models.Eft.Common.LooseLoot"/> - assign one directly, it converts - or the
+    /// raw JSON of a location's <c>looseLoot.json</c>. Same wire shape either way.
+    /// </summary>
     [JsonPropertyName("looseLoot")]
-    public required LooseLoot LooseLoot { get; set; }
+    public required LooseLootPayload LooseLoot { get; set; }
+}
+
+/// <summary>
+/// The <c>looseLoot</c> member of <see cref="DynamicLootRequest"/> in one of its two forms: a
+/// <see cref="Models.Eft.Common.LooseLoot"/> to serialise as usual, or the raw JSON of the location's
+/// <c>looseLoot.json</c> to write through verbatim. The raw form exists because the typed form costs
+/// a parse and a re-encode of 42 MB for bigmap; see <c>LocationLootGenerator.GenerateDynamicLoot</c>
+/// for when each is used.
+/// </summary>
+[JsonConverter(typeof(LooseLootPayloadConverter))]
+public sealed record LooseLootPayload
+{
+    private LooseLootPayload() { }
+
+    public LooseLoot? Typed { get; private init; }
+
+    /// <summary>
+    /// UTF-8 JSON, written into the request unchanged.
+    /// </summary>
+    public ReadOnlyMemory<byte>? RawJson { get; private init; }
+
+    public static LooseLootPayload FromRawJson(ReadOnlyMemory<byte> rawJson)
+    {
+        return new LooseLootPayload { RawJson = rawJson };
+    }
+
+    public static implicit operator LooseLootPayload(LooseLoot typed)
+    {
+        return new LooseLootPayload { Typed = typed };
+    }
+}
+
+/// <summary>
+/// Write-only: the payload is a request member, and nothing deserialises one.
+/// </summary>
+public sealed class LooseLootPayloadConverter : JsonConverter<LooseLootPayload>
+{
+    public override LooseLootPayload Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        throw new NotSupportedException($"{nameof(LooseLootPayload)} is only ever written.");
+    }
+
+    public override void Write(Utf8JsonWriter writer, LooseLootPayload value, JsonSerializerOptions options)
+    {
+        if (value.RawJson is { } rawJson)
+        {
+            // Validation is skipped because the native parser validates the same bytes immediately
+            // after, and re-scanning 42 MB here would give back part of what the raw path saves
+            writer.WriteRawValue(rawJson.Span, skipInputValidation: true);
+
+            return;
+        }
+
+        JsonSerializer.Serialize(writer, value.Typed, options);
+    }
 }
 
 /// <summary>

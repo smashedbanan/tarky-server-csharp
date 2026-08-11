@@ -430,6 +430,14 @@ public class PostDbLoadService(
                 continue;
             }
 
+            // A map listed with nothing to add gets no transformer at all - vanilla loot.json lists
+            // three. An empty transformer changes no loot but does cost the loot generator its
+            // raw-JSON shortcut, which only holds while nothing transforms the file
+            if (positionsToAdd.Length == 0)
+            {
+                continue;
+            }
+
             locationTable
                 .GetLocation(locationId)
                 .LooseLoot.AddTransformer(looseLootData =>
@@ -570,6 +578,12 @@ public class PostDbLoadService(
 
         foreach (var (mapId, mapAdjustments) in lootConfig.LooseLootSpawnPointAdjustments)
         {
+            // Nothing to adjust, so no transformer - see AddCustomLooseLootPositions
+            if (mapAdjustments.Count == 0)
+            {
+                continue;
+            }
+
             locationTable
                 .GetLocation(mapId)
                 .LooseLoot.AddTransformer(looselootData =>

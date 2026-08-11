@@ -73,8 +73,18 @@ public class LocationLootGenerator(
         // Create containers with loot
         result.AddRange(GenerateStaticContainers(locationId.ToLowerInvariant(), staticAmmoDistClone));
 
+        // Nothing has asked to transform the loose loot, so skip materialising it: a null argument
+        // sends the location's file over as raw JSON instead of parsing 42 MB of loot into objects
+        // only to encode it straight back out. A registered transformer takes the typed path.
+        var looseLoot = locationDetails.LooseLoot;
+        var untransformed = looseLoot is { HasTransformers: false, HasRawJson: true };
+
         // Add dynamic loot to output loot
-        var dynamicSpawnPoints = GenerateDynamicLoot(locationDetails.LooseLoot.Value, staticAmmoDistClone, locationId.ToLowerInvariant());
+        var dynamicSpawnPoints = GenerateDynamicLoot(
+            untransformed ? null : looseLoot?.Value,
+            staticAmmoDistClone,
+            locationId.ToLowerInvariant()
+        );
 
         // Merge dynamic spawns into result
         result.AddRange(dynamicSpawnPoints);
@@ -136,12 +146,15 @@ public class LocationLootGenerator(
     /// <summary>
     ///     Create array of loose + forced loot using probability system
     /// </summary>
-    /// <param name="dynamicLootDist"></param>
+    /// <param name="dynamicLootDist">
+    ///     Loot data to generate from, or null to use the location's own <c>looseLoot.json</c> as the
+    ///     raw JSON it sits on disk as - only valid when nothing transforms that file
+    /// </param>
     /// <param name="staticAmmoDist"></param>
     /// <param name="locationName">Location to generate loot for</param>
     /// <returns>Array of spawn points with loot in them</returns>
     public List<SpawnpointTemplate> GenerateDynamicLoot(
-        LooseLoot dynamicLootDist,
+        LooseLoot? dynamicLootDist,
         Dictionary<string, IEnumerable<StaticAmmoDetails>> staticAmmoDist,
         string locationName
     )
@@ -161,7 +174,7 @@ public class LocationLootGenerator(
                 LootableItemBlacklist = common.LootableItemBlacklist,
                 Counter = common.Counter,
                 // The caller's loot data, so any transformer or patch applied to it is honoured
-                LooseLoot = dynamicLootDist,
+                LooseLoot = dynamicLootDist is null ? RawLooseLootJson(locationName) : dynamicLootDist,
             }
         );
 
@@ -171,6 +184,29 @@ public class LocationLootGenerator(
         counterTrackerHelper.SetTrackedCounts(result.TrackedCounts);
 
         return result.Spawnpoints;
+    }
+
+    /// <summary>
+    /// A location's loose loot as the raw JSON it sits on disk as. Only equivalent to
+    /// <c>LazyLoad.Value</c> while no transformer is registered, which is what makes it safe to
+    /// splice: with none registered the file is if anything the more faithful of the two, since
+    /// explicit nulls and members the C# models do not declare survive it. Throws rather than
+    /// quietly generating from nothing when the raw JSON is not usable.
+    /// </summary>
+    private LooseLootPayload RawLooseLootJson(string locationId)
+    {
+        var looseLoot = locationTable.GetLocation(locationId)?.LooseLoot;
+        var rawJson = looseLoot is { HasTransformers: false } ? looseLoot.ReadRawJson() : null;
+
+        if (rawJson is null)
+        {
+            throw new InvalidOperationException(
+                $"Location: {locationId} has no raw loose loot JSON to generate from - it is missing, or a transformer is "
+                    + "registered on it. Pass the LooseLoot to generate from instead of null."
+            );
+        }
+
+        return LooseLootPayload.FromRawJson(rawJson.Value);
     }
 
     /// <summary>

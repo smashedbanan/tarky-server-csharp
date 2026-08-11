@@ -3,9 +3,12 @@ using NUnit.Framework;
 using SPTarkov.Server.Core.Generators.Loot;
 using SPTarkov.Server.Core.Models.Common;
 using SPTarkov.Server.Core.Models.Eft.Common;
+using SPTarkov.Server.Core.Models.Enums;
 using SPTarkov.Server.Core.Models.Spt.Config;
 using SPTarkov.Server.Core.Models.Spt.Tables;
+using SPTarkov.Server.Core.Services.Server;
 using SPTarkov.Server.Core.Utils;
+using SPTarkov.Server.Core.Utils.Json;
 
 namespace UnitTests.Tests.Generators;
 
@@ -22,6 +25,14 @@ public class LocationLootGeneratorTests
     private const string SmokeLocationId = "factory4_day";
 
     /// <summary>
+    /// Spawn point ids that only exist in the loot data a single test hands over, so a result can be
+    /// traced back to the loose loot it was generated from.
+    /// </summary>
+    private const string RawFileMarkerId = "raw_file_marker";
+
+    private const string TransformedMarkerId = "transformed_marker";
+
+    /// <summary>
     /// Mean wall-clock of the deleted C# <c>GenerateLocationLoot("bigmap")</c> over 200 Release runs,
     /// recorded in the Task 12 harness commit af4f5b8c. The native path has to come in under it.
     /// </summary>
@@ -34,6 +45,7 @@ public class LocationLootGeneratorTests
     private TemplateTable _templateTable = default!;
     private LocationTable _locationTable = default!;
     private LocationConfig _locationConfig = default!;
+    private SeasonalEventService _seasonalEventService = default!;
 
     private List<SpawnpointTemplate> _spawnpoints = default!;
 
@@ -49,6 +61,7 @@ public class LocationLootGeneratorTests
         _templateTable = di.GetService<TemplateTable>();
         _locationTable = di.GetService<LocationTable>();
         _locationConfig = di.GetService<LocationConfig>();
+        _seasonalEventService = di.GetService<SeasonalEventService>();
 
         // One raid's worth of loot, shared by every assertion below - generation is the expensive part
         _spawnpoints = _locationLootGenerator.GenerateLocationLoot(LocationId);
@@ -217,6 +230,118 @@ public class LocationLootGeneratorTests
         var second = _locationLootGenerator.GenerateLocationLoot(LocationId);
 
         Assert.That(second, Has.Count.GreaterThan(_spawnpoints.Count / 2));
+    }
+
+    /// <summary>
+    /// Whether the raw JSON shortcut is taken is invisible in the generated loot - the only other
+    /// thing that observes it is <see cref="GenerateLocationLootBeatsTheCSharpBaseline"/>, and only on
+    /// release builds. A startup transformer that changes no loot would quietly put every raid back on
+    /// the 42 MB parse, which is exactly what vanilla <c>loot.json</c> used to do: it lists bigmap in
+    /// two transformer-driving sections with nothing in either.
+    /// </summary>
+    [Test]
+    public void BigmapLooseLootIsOnTheRawJsonPathAfterStartup()
+    {
+        if (_seasonalEventService.ChristmasEventEnabled())
+        {
+            Assert.Ignore("the christmas event registers a loose loot transformer that does change loot, so the typed path is correct");
+        }
+
+        var looseLoot = _locationTable.GetLocation(LocationId)!.LooseLoot!;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(looseLoot.HasRawJson, "the database importer did not hand the lazy load a raw JSON source");
+            Assert.That(looseLoot.HasTransformers, Is.False, "a startup transformer took loot generation off the raw JSON path");
+        });
+    }
+
+    /// <summary>
+    /// A location whose loose loot is untransformed goes over the boundary as the raw file JSON, which
+    /// is only equivalent while nothing transforms it. A registered transformer has to put the
+    /// generator back on the typed path: the file and the transformer are marked with different spawn
+    /// point ids, so a result generated from the wrong one of the two is visible either way.
+    /// </summary>
+    [Test]
+    public void ARegisteredTransformerIsHonouredInsteadOfTheRawFileJson()
+    {
+        var location = _locationTable.GetLocation(LocationId)!;
+        var originalLooseLoot = location.LooseLoot;
+        var file = Path.Combine(Path.GetTempPath(), $"looseLoot-{Guid.NewGuid():N}.json");
+
+        try
+        {
+            // File-backed exactly as the database importer builds it, so the raw JSON *is* available
+            // and only the registered transformer can keep the generator off it
+            File.WriteAllText(file, _jsonUtil.Serialize(BuildMarkedLooseLoot(RawFileMarkerId))!);
+
+            var lazyLoad = new LazyLoad<LooseLoot>(
+                () => _jsonUtil.DeserializeFromFile<LooseLoot>(file)!,
+                () => new ReadOnlyMemory<byte>(File.ReadAllBytes(file))
+            );
+            lazyLoad.AddTransformer(_ => BuildMarkedLooseLoot(TransformedMarkerId));
+            location.LooseLoot = lazyLoad;
+
+            var spawnpointIds = _locationLootGenerator.GenerateLocationLoot(LocationId).Select(spawnpoint => spawnpoint.Id).ToList();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(spawnpointIds, Does.Contain(TransformedMarkerId), "the transformer never ran");
+                Assert.That(spawnpointIds, Does.Not.Contain(RawFileMarkerId), "the raw file JSON was spliced past the transformer");
+            });
+        }
+        finally
+        {
+            // The DI container is shared with every other fixture
+            location.LooseLoot = originalLooseLoot;
+            File.Delete(file);
+        }
+    }
+
+    /// <summary>
+    /// A caller that hands over its own loot data - a mod, or the transformed path above - generates
+    /// from exactly that, never from the location's file.
+    /// </summary>
+    [Test]
+    public void GenerateDynamicLootGeneratesFromTheLooseLootItWasGiven()
+    {
+        var location = _locationTable.GetLocation(LocationId)!;
+
+        var spawnpoints = _locationLootGenerator.GenerateDynamicLoot(
+            BuildMarkedLooseLoot(TransformedMarkerId),
+            location.StaticAmmo,
+            LocationId
+        );
+
+        Assert.That(spawnpoints, Has.Count.EqualTo(1), "the given loot data holds exactly one forced spawn point");
+        Assert.That(spawnpoints[0].Id, Is.EqualTo(TransformedMarkerId));
+    }
+
+    /// <summary>
+    /// One forced loose loot point holding roubles, tagged with <paramref name="markerId"/>. The mean
+    /// spawn point count is zero, so the forced point is the only thing that can come back.
+    /// </summary>
+    private static LooseLoot BuildMarkedLooseLoot(string markerId)
+    {
+        return new LooseLoot
+        {
+            SpawnpointCount = new SpawnpointCount { Mean = 0, Std = 0 },
+            SpawnpointsForced =
+            [
+                new Spawnpoint
+                {
+                    LocationId = markerId,
+                    Probability = 1,
+                    Template = new SpawnpointTemplate
+                    {
+                        Id = markerId,
+                        Root = new MongoId().ToString(),
+                        Items = [new SptLootItem { Id = new MongoId(), Template = Money.ROUBLES }],
+                    },
+                },
+            ],
+            Spawnpoints = [],
+        };
     }
 
     /// <summary>

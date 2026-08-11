@@ -259,7 +259,13 @@ public sealed class ImporterUtil(ISptLogger<ImporterUtil> logger, FileUtil fileU
 
         var expressionDelegate = expression.Compile();
 
-        return Activator.CreateInstance(propertyType, expressionDelegate);
+        // The file the deserialisation reads, handed over unparsed for callers that only re-encode it
+        Func<ReadOnlyMemory<byte>?> readRawJson = () =>
+        {
+            return File.Exists(file) ? new ReadOnlyMemory<byte>(File.ReadAllBytes(file)) : null;
+        };
+
+        return Activator.CreateInstance(propertyType, expressionDelegate, readRawJson);
     }
 
     public MethodInfo GetSetMethod(string propertyName, Type type, out Type propertyType, out bool isDictionary)

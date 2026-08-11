@@ -149,6 +149,68 @@ public class LocationLootGeneratorNativeTests
         Assert.That(result.TrackedCounts, Is.Empty);
     }
 
+    /// <summary>
+    /// The raw form of the looseLoot payload reaches the wire byte for byte: a member the C# models do
+    /// not declare and an explicit null both survive it, and neither would have survived the typed
+    /// writer. This is what makes splicing the file safe - the raw JSON is the more faithful of the
+    /// two, not the lossier.
+    /// </summary>
+    [Test]
+    public void RawLooseLootJsonIsWrittenIntoTheRequestVerbatim()
+    {
+        var request = BuildDynamicRequest();
+        var rawJson = JsonNode.Parse(_jsonUtil.Serialize(request.LooseLoot.Typed)!)!;
+        rawJson["modAddedField"] = "kept";
+        rawJson["modAddedNull"] = null;
+
+        request.LooseLoot = LooseLootPayload.FromRawJson(Encoding.UTF8.GetBytes(rawJson.ToJsonString()));
+        var serialised = JsonNode.Parse(_jsonUtil.Serialize(request)!)!;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(JsonNode.DeepEquals(serialised["looseLoot"], rawJson), "the raw JSON was not written through unchanged");
+            // Spliced into a normal request, not in place of one
+            Assert.That(serialised["locationId"]!.GetValue<string>(), Is.EqualTo(TestLocationId));
+        });
+    }
+
+    /// <summary>
+    /// The typed form is what every caller handing over a <c>LooseLoot</c> still gets: the wrapper is
+    /// invisible on the wire.
+    /// </summary>
+    [Test]
+    public void TheTypedLooseLootPayloadSerialisesAsThePlainModelDid()
+    {
+        var request = BuildDynamicRequest();
+
+        var throughTheRequest = JsonNode.Parse(_jsonUtil.Serialize(request)!)!["looseLoot"];
+        var onItsOwn = JsonNode.Parse(_jsonUtil.Serialize(request.LooseLoot.Typed)!);
+
+        Assert.That(JsonNode.DeepEquals(throughTheRequest, onItsOwn), "the wrapper changed the JSON the model serialises to");
+    }
+
+    /// <summary>
+    /// The spliced bytes have to be JSON the native side reads the same way as the typed form - a
+    /// quoted or otherwise mangled raw value would fail to parse over there.
+    /// </summary>
+    [Test]
+    public void ARawLooseLootRequestGeneratesTheSameSpawnpointsAsTheTypedOne()
+    {
+        var typedRequest = BuildDynamicRequest();
+        var rawRequest = BuildDynamicRequest();
+        rawRequest.LooseLoot = LooseLootPayload.FromRawJson(Encoding.UTF8.GetBytes(_jsonUtil.Serialize(typedRequest.LooseLoot.Typed)!));
+
+        var fromTyped = SptNative.GenerateDynamicLoot(typedRequest);
+        var fromRaw = SptNative.GenerateDynamicLoot(rawRequest);
+
+        // Item ids are minted per call, so only the spawn point identity and its loot can be compared
+        Assert.That(
+            fromRaw.Spawnpoints.Select(spawnpoint => spawnpoint.Id),
+            Is.EqualTo(fromTyped.Spawnpoints.Select(spawnpoint => spawnpoint.Id))
+        );
+        Assert.That(fromRaw.Spawnpoints.Single().Items!.Single().Template, Is.EqualTo(_moneyTpl));
+    }
+
     [Test]
     public void AGenerationFailureSurfacesTheNativeMessage()
     {
