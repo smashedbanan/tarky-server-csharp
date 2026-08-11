@@ -140,11 +140,13 @@ pub fn replace_ids(items: &mut [Item]) {
 
 /// `ItemExtensions.RemapRootItemId` (`ItemExtensions.cs:424-448`) — the root is the first element;
 /// only its id and its direct children's `parentId` move.
+///
+/// **Empty input is the C# throw path** — `ItemExtensions.cs:428` dereferences `FirstOrDefault()`
+/// unguarded and throws. This returns a fresh id with nothing remapped instead of panicking behind
+/// the FFI boundary, so callers must branch to the error/fallback path themselves.
 pub fn remap_root_item_id(items: &mut [Item]) -> String {
     let new_id = mongo_id::generate();
 
-    // C# indexes the first element unguarded; an empty list has no root to remap, so just hand back
-    // the id rather than panicking behind the FFI boundary.
     let Some(root_item_existing_id) = items.first().map(|item| item.id.clone()) else {
         return new_id;
     };
@@ -165,9 +167,17 @@ pub fn remap_root_item_id(items: &mut [Item]) -> String {
 }
 
 /// `ItemHelper.ReparentItemAndChildren` (`ItemHelper.cs:1680-1717`) — re-id the whole tree under
-/// `root_item`'s id, then replace element 0 with `root_item` itself. C# mutates and returns the same
-/// list; this mutates in place and hands back a copy of it. The slice takes a `&mut Vec` at the call
-/// site unchanged — clippy rejects the `Vec` in the signature since nothing here resizes.
+/// `root_item`'s id, then replace element 0 with `root_item` itself. The slice takes a `&mut Vec` at
+/// the call site unchanged — clippy rejects the `Vec` in the signature since nothing here resizes.
+///
+/// **Empty input is the C# throw path** — `ItemHelper.cs:1682` indexes `itemWithChildren[0]`
+/// unguarded and throws, which `LocationLootGenerator.cs:1152-1172` catches to log
+/// `location-preset_not_found` (naming three production tpls that hit it) before rethrowing. This
+/// returns an empty `Vec` rather than panicking behind the FFI boundary, so callers must branch to
+/// that error path themselves.
+///
+/// C# returns the very list it mutated; this returns a **detached deep copy**, so later mutations to
+/// the returned `Vec` do not reach the input slice (and vice versa).
 pub fn reparent_item_and_children(root_item: &Item, item_with_children: &mut [Item]) -> Vec<Item> {
     let Some(old_root_id) = item_with_children.first().map(|item| item.id.clone()) else {
         return Vec::new();
@@ -224,6 +234,8 @@ pub fn get_item_size(
         };
 
         if item_db_template.extra_size_force_add.unwrap_or(false) {
+            // Deviation: C# uses `ExtraSizeUp!.Value` here and throws on a force-add template with a
+            // null ExtraSize; unreachable with real data, and a panic behind FFI is worse.
             forced_up += item_db_template.extra_size_up.unwrap_or(0);
             forced_down += item_db_template.extra_size_down.unwrap_or(0);
             forced_left += item_db_template.extra_size_left.unwrap_or(0);
@@ -500,6 +512,27 @@ mod tests {
         assert_eq!(result[4].parent_id.as_ref(), Some(&result[1].id));
         // The in-place list and the returned list agree.
         assert_eq!(ids(&items), ids(&result));
+    }
+
+    /// The parent mapping is created on demand (`ItemHelper.cs:1697-1701`), so a child listed before
+    /// its parent still lands on the id that parent goes on to take.
+    #[test]
+    fn reparent_item_and_children_maps_a_parent_listed_after_its_child() {
+        let mut items = vec![
+            item("r", HELMET_TPL, None),
+            item("c", MOD_PLAIN_A_TPL, Some("p")),
+            item("p", MOD_PLAIN_B_TPL, Some("r")),
+        ];
+        let root_item = item("new_root", ARMOR_VEST_TPL, None);
+
+        let result = reparent_item_and_children(&root_item, &mut items);
+
+        // "p" had no mapping yet when "c" was processed, and got that same fresh id when its own
+        // turn came.
+        assert_eq!(result[2].id.len(), 24);
+        assert_ne!(result[2].id, "p");
+        assert_eq!(result[1].parent_id.as_ref(), Some(&result[2].id));
+        assert_eq!(result[2].parent_id.as_deref(), Some("new_root"));
     }
 
     #[test]
