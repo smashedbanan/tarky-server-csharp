@@ -369,4 +369,24 @@ mod tests {
         };
         assert_eq!(status, STATUS_BAD_ARGS);
     }
+
+    #[test]
+    fn a_null_out_pointer_returns_bad_args_without_writing() {
+        // The request itself is fine, so only the out-pointer guard can reject it — and it has to,
+        // since the failure paths write a message buffer through that pointer.
+        let request = empty_static_request();
+        let mut out_len: usize = 0;
+
+        let status = unsafe {
+            spt_generate_static_containers(
+                request.as_ptr(),
+                request.len(),
+                std::ptr::null_mut(),
+                &mut out_len,
+            )
+        };
+
+        assert_eq!(status, STATUS_BAD_ARGS);
+        assert_eq!(out_len, 0, "nothing may be written when out_ptr is null");
+    }
 }
