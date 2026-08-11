@@ -37,6 +37,12 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(LibraryName, EntryPoint = "spt_verify_database")]
     internal static partial int VerifyDatabase(byte* dirUtf8, nuint dirLen, byte** outPtr, nuint* outLen);
 
+    [LibraryImport(LibraryName, EntryPoint = "spt_generate_static_containers")]
+    internal static partial int GenerateStaticContainers(byte* requestUtf8, nuint requestLen, byte** outPtr, nuint* outLen);
+
+    [LibraryImport(LibraryName, EntryPoint = "spt_generate_dynamic_loot")]
+    internal static partial int GenerateDynamicLoot(byte* requestUtf8, nuint requestLen, byte** outPtr, nuint* outLen);
+
     [LibraryImport(LibraryName, EntryPoint = "spt_buf_free")]
     internal static partial void BufFree(byte* ptr, nuint len);
 }

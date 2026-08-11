@@ -1,6 +1,8 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using SPTarkov.Server.Core.Native.Loot;
+using SPTarkov.Server.Core.Utils;
 
 namespace SPTarkov.Server.Core.Native;
 
@@ -25,9 +27,22 @@ public sealed class VerifyResult
     public int Checked { get; set; }
 }
 
+/// <summary>
+/// Picks which of the two loot exports a request goes to.
+/// </summary>
+internal enum LootExport
+{
+    StaticContainers,
+    DynamicLoot,
+}
+
 public static class SptNative
 {
     private const uint ExpectedAbiVersion = 2;
+
+    // ffi.rs
+    private const int StatusOk = 0;
+    private const int StatusError = 3;
 
     // No CancellationToken: the native hash pass is a single bounded blocking call that cannot be
     // interrupted once in flight, so accepting a token would promise cancellation it can't deliver.
@@ -48,6 +63,90 @@ public static class SptNative
             throw new InvalidOperationException(
                 $"spt_native ABI version mismatch: expected {ExpectedAbiVersion}, found {actual}. Rebuild the native library (dotnet build runs cargo automatically)."
             );
+        }
+    }
+
+    /// <summary>
+    /// Fills a map's static containers with loot.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Generation failed, or the native side misbehaved.</exception>
+    public static StaticContainersResult GenerateStaticContainers(StaticContainersRequest request)
+    {
+        return Generate<StaticContainersResult>(LootExport.StaticContainers, JsonSerializer.SerializeToUtf8Bytes(request, LootJsonOptions));
+    }
+
+    /// <summary>
+    /// Picks a map's loose loot spawn points and fills them.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Generation failed, or the native side misbehaved.</exception>
+    public static DynamicLootResult GenerateDynamicLoot(DynamicLootRequest request)
+    {
+        return Generate<DynamicLootResult>(LootExport.DynamicLoot, JsonSerializer.SerializeToUtf8Bytes(request, LootJsonOptions));
+    }
+
+    /// <summary>
+    /// The shared body of the two generation wrappers, taking the request as the UTF-8 JSON the
+    /// native side reads. Internal so tests can hand it JSON that no typed payload can express: a
+    /// mod-added field, or a deliberately malformed request.
+    /// </summary>
+    internal static unsafe TResult Generate<TResult>(LootExport export, ReadOnlySpan<byte> requestUtf8)
+    {
+        EnsureLoadable();
+
+        byte* outPtr = null;
+        nuint outLen = 0;
+        int status;
+
+        fixed (byte* requestPtr = requestUtf8)
+        {
+            status = export switch
+            {
+                LootExport.StaticContainers => NativeMethods.GenerateStaticContainers(
+                    requestPtr,
+                    (nuint)requestUtf8.Length,
+                    &outPtr,
+                    &outLen
+                ),
+                _ => NativeMethods.GenerateDynamicLoot(requestPtr, (nuint)requestUtf8.Length, &outPtr, &outLen),
+            };
+        }
+
+        // Unlike verify, these exports also write a buffer when they fail - the error message - so
+        // ownership is decided by the pointer, never by the status. BufFree ignores the null pointer
+        // a null-argument rejection or a panic leaves behind.
+        try
+        {
+            if (status == StatusOk)
+            {
+                return JsonSerializer.Deserialize<TResult>(new ReadOnlySpan<byte>(outPtr, checked((int)outLen)), LootJsonOptions)
+                    ?? throw new InvalidOperationException($"spt_native returned an empty {export} result.");
+            }
+
+            var message = outPtr == null ? "no message" : Encoding.UTF8.GetString(outPtr, checked((int)outLen));
+            if (status == StatusError)
+            {
+                throw new InvalidOperationException($"spt_native {export} generation failed: {message}");
+            }
+
+            throw new InvalidOperationException(
+                $"spt_native {export} generation failed with internal status {status}: {message}; this indicates a native library bug, not corrupt game data."
+            );
+        }
+        finally
+        {
+            NativeMethods.BufFree(outPtr, outLen);
+        }
+    }
+
+    /// <summary>
+    /// The options JsonUtil publishes at startup: loot payloads need its MongoId and enum converters.
+    /// </summary>
+    private static JsonSerializerOptions LootJsonOptions
+    {
+        get
+        {
+            return JsonUtil.JsonSerializerOptionsNoIndent
+                ?? throw new InvalidOperationException("JsonUtil has not been built yet, so the loot payload converters are unavailable.");
         }
     }
 
