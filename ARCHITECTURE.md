@@ -192,8 +192,13 @@ rather than at first use.
 
 The hash contract is shared with `Libraries/SPTarkov.Server.Assets/build/PostBuild.cs`, which writes
 `checks.dat` as base64 JSON of `{Path, Hash}` pairs with `System.IO.Hashing.XxHash128` — canonical
-big-endian hex, matching Rust's `xxh3_128` formatting. The verified set must also stay in sync with
-`ImporterUtil`'s ignore lists (reciprocal comments mark both sides).
+big-endian hex, matching Rust's `xxh3_128` formatting. Verification scope is manifest-driven: the
+verifier walks the top-level `SPT_Data` directories the manifest names (`configs/`, `database/`)
+and requires an exact match in both directions — a walked file absent from the manifest fails, and
+a manifest entry with no regular file on disk fails, so deletions and symlink swaps are caught.
+Top-level entries the manifest never names stay unverified automatically: `images/` (skipped by the
+generator) and the artifacts the build relocates into the output `SPT_Data` (`dotnet/` satellite
+assemblies, `wwwroot/` admin-panel assets).
 
 Build coupling: `BuildSptNative` in `SPTarkov.Server.Core.csproj` shells out to `cargo build` before
 compiling, so **`cargo` on `PATH` is a hard build dependency** — no rustup, no build. The artifact is

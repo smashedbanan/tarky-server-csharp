@@ -27,21 +27,38 @@ public class SptNativeVerifyTests
     [Test]
     public async Task CleanTreePassesVerification()
     {
+        // Everything under manifest-named roots is verified — configs/, non-json files and the
+        // ImporterUtil-ignored locale dirs included. Top-level entries the manifest never names
+        // (images/, the relocated dotnet/ and wwwroot/ build artifacts) are not.
         WriteDatabaseFile("database/globals.json", """{"a":1}""");
         WriteDatabaseFile("database/templates/items.json", """{"b":2}""");
-        // Every ImporterUtil exclusion the native verifier mirrors, so a drift on either side fails here.
-        WriteDatabaseFile("database/locales/server/en.json", """{"ignored":true}""");
-        WriteDatabaseFile("database/locales/web/en.json", """{"ignored":true}""");
-        WriteDatabaseFile("database/bearsuits.json", """{"ignored":true}""");
-        WriteDatabaseFile("database/usecsuits.json", """{"ignored":true}""");
-        WriteDatabaseFile("database/archivedquests.json", """{"ignored":true}""");
-        WriteChecksDat("database/globals.json", "database/templates/items.json");
+        WriteDatabaseFile("database/locales/server/en.json", """{"c":3}""");
+        WriteDatabaseFile("configs/core.json", """{"d":4}""");
+        WriteDatabaseFile("images/icon.png", "not hashed");
+        WriteDatabaseFile("dotnet/de/Spectre.Console.Cli.resources.dll", "not hashed");
+        WriteDatabaseFile("wwwroot/index.html", "not hashed");
+        WriteChecksDat("database/globals.json", "database/templates/items.json", "database/locales/server/en.json", "configs/core.json");
 
         var result = await SptNative.VerifyDatabaseAsync(_sptDataDir);
 
         Assert.That(result.Ok, Is.True);
-        Assert.That(result.Checked, Is.EqualTo(2));
+        Assert.That(result.Checked, Is.EqualTo(4));
         Assert.That(result.Failures, Is.Empty);
+    }
+
+    [Test]
+    public async Task DeletedFileFailsVerification()
+    {
+        WriteDatabaseFile("database/globals.json", """{"a":1}""");
+        WriteDatabaseFile("database/deleted.json", """{"gone":true}""");
+        WriteChecksDat("database/globals.json", "database/deleted.json");
+        File.Delete(Path.Combine(_sptDataDir, "database", "deleted.json"));
+
+        var result = await SptNative.VerifyDatabaseAsync(_sptDataDir);
+
+        Assert.That(result.Ok, Is.False);
+        Assert.That(result.Failures[0].Path, Is.EqualTo("database/deleted.json"));
+        Assert.That(result.Failures[0].Reason, Is.EqualTo("missing_from_disk"));
     }
 
     [Test]

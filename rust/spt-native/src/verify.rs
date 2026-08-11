@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -23,47 +23,38 @@ pub fn parse_manifest(raw: &[u8]) -> Result<HashMap<String, String>, String> {
     Ok(entries.into_iter().map(|e| (e.path, e.hash)).collect())
 }
 
-// Keep in sync with `_filesToIgnore`/`_directoriesToIgnore` in
-// Libraries/SPTarkov.Server.Core/Utils/ImporterUtil.cs: a file the importer loads but this list
-// skips is imported without ever being tamper-checked.
-const IGNORED_FILE_NAMES: [&str; 3] = ["bearsuits.json", "usecsuits.json", "archivedquests.json"];
-const IGNORED_DIR_KEYS: [&str; 2] = ["database/locales/server", "database/locales/web"];
-
 fn relative_key(spt_data: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(spt_data).ok()?;
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
-pub fn collect_files(spt_data: &Path) -> Vec<(PathBuf, String)> {
-    let database_dir = spt_data.join("database");
+// The verified universe is every top-level SPT_Data entry the manifest names (configs/,
+// database/): within those roots, disk and manifest must match in both directions. Scope is
+// derived from the manifest instead of walking all of SPT_Data because the build relocates
+// unhashed artifacts into the output SPT_Data (satellite assemblies under dotnet/, admin-panel
+// static assets under wwwroot/ — see RelocateSatelliteAssemblies in SPTarkov.Server.csproj),
+// and PostBuild.cs deliberately leaves images/ and checks.dat out of the manifest.
+pub fn collect_files(
+    spt_data: &Path,
+    manifest: &HashMap<String, String>,
+) -> Vec<(PathBuf, String)> {
+    let roots: HashSet<&str> = manifest
+        .keys()
+        .map(|key| key.split('/').next().unwrap_or(key))
+        .collect();
+
     let mut files = Vec::new();
-
-    let walker = walkdir::WalkDir::new(&database_dir)
-        .into_iter()
-        .filter_entry(|entry| {
-            if !entry.file_type().is_dir() {
-                return true;
+    for root in roots {
+        for entry in walkdir::WalkDir::new(spt_data.join(root))
+            .into_iter()
+            .flatten()
+        {
+            if !entry.file_type().is_file() {
+                continue;
             }
-            match relative_key(spt_data, entry.path()) {
-                Some(key) => !IGNORED_DIR_KEYS.contains(&key.as_str()),
-                None => true,
+            if let Some(key) = relative_key(spt_data, entry.path()) {
+                files.push((entry.path().to_path_buf(), key));
             }
-        });
-
-    for entry in walker.flatten() {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_lowercase();
-        if IGNORED_FILE_NAMES.contains(&name.as_str()) {
-            continue;
-        }
-        if let Some(key) = relative_key(spt_data, path) {
-            files.push((path.to_path_buf(), key));
         }
     }
 
@@ -97,18 +88,28 @@ pub async fn verify(spt_data: PathBuf) -> VerifyReport {
         Err(e) => return manifest_failure(format!("cannot read checks.dat: {e}")),
     };
 
-    let files = collect_files(&spt_data);
-    let checked = files.len();
-    if checked == 0 {
-        return VerifyReport {
-            ok: false,
-            failures: vec![Failure {
-                path: "database".into(),
-                reason: "no verifiable files found".into(),
-            }],
-            checked: 0,
-        };
+    // An empty manifest would otherwise verify nothing and pass vacuously.
+    if manifest.is_empty() {
+        return manifest_failure("manifest is empty".into());
     }
+
+    let files = collect_files(&spt_data, &manifest);
+    let checked = files.len();
+
+    // Reverse direction: a manifest entry with no walked file means the file was deleted or
+    // replaced by something the walk skips (e.g. a symlink) — fail, don't silently pass.
+    let missing_from_disk: Vec<Failure> = {
+        let walked: HashSet<&str> = files.iter().map(|(_, key)| key.as_str()).collect();
+        manifest
+            .keys()
+            .filter(|key| !walked.contains(key.as_str()))
+            .map(|key| Failure {
+                path: key.clone(),
+                reason: "missing_from_disk".into(),
+            })
+            .collect()
+    };
+
     let manifest = Arc::new(manifest);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES));
     let mut tasks = tokio::task::JoinSet::new();
@@ -123,6 +124,7 @@ pub async fn verify(spt_data: PathBuf) -> VerifyReport {
     }
 
     let mut failures: Vec<Failure> = tasks.join_all().await.into_iter().flatten().collect();
+    failures.extend(missing_from_disk);
     failures.sort_by(|a, b| a.path.cmp(&b.path));
 
     VerifyReport {
@@ -240,8 +242,15 @@ mod tests {
         fs::write(path, b"{}").unwrap();
     }
 
-    fn keys(spt_data: &Path) -> Vec<String> {
-        let mut keys: Vec<String> = collect_files(spt_data)
+    fn manifest_of(entries: &[&str]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|key| (key.to_string(), String::new()))
+            .collect()
+    }
+
+    fn keys(spt_data: &Path, manifest: &HashMap<String, String>) -> Vec<String> {
+        let mut keys: Vec<String> = collect_files(spt_data, manifest)
             .into_iter()
             .map(|(_, k)| k)
             .collect();
@@ -250,63 +259,41 @@ mod tests {
     }
 
     #[test]
-    fn collects_nested_json_files_only() {
+    fn collects_every_file_under_manifest_named_roots() {
+        // Non-json files and the importer-ignored locale dirs are in checks.dat, so they
+        // must all be walked.
         let dir = TempDir::new().unwrap();
         touch(dir.path(), "database/globals.json");
-        touch(dir.path(), "database/templates/items.json");
         touch(dir.path(), "database/readme.txt");
+        touch(dir.path(), "database/locales/server/en.json");
         touch(dir.path(), "configs/core.json");
+        let manifest = manifest_of(&["database/globals.json", "configs/core.json"]);
         assert_eq!(
-            keys(dir.path()),
+            keys(dir.path(), &manifest),
             vec![
+                "configs/core.json".to_string(),
                 "database/globals.json".to_string(),
-                "database/templates/items.json".to_string()
+                "database/locales/server/en.json".to_string(),
+                "database/readme.txt".to_string(),
             ]
         );
     }
 
     #[test]
-    fn excludes_ignored_filenames_case_insensitively() {
+    fn ignores_top_level_entries_the_manifest_never_names() {
+        // The build relocates unhashed artifacts (dotnet/, wwwroot/) into the output SPT_Data,
+        // and the generator skips images/ and checks.dat — none of these may fail verification.
         let dir = TempDir::new().unwrap();
-        touch(dir.path(), "database/BearSuits.json");
-        touch(dir.path(), "database/usecsuits.json");
-        touch(dir.path(), "database/ArchivedQuests.json");
+        touch(dir.path(), "dotnet/de/Spectre.Console.Cli.resources.dll");
+        touch(dir.path(), "wwwroot/index.html");
+        touch(dir.path(), "images/icon.png");
         touch(dir.path(), "database/kept.json");
-        assert_eq!(keys(dir.path()), vec!["database/kept.json".to_string()]);
-    }
-
-    #[test]
-    fn excludes_ignored_locale_directories() {
-        let dir = TempDir::new().unwrap();
-        touch(dir.path(), "database/locales/server/en.json");
-        touch(dir.path(), "database/locales/web/en.json");
-        touch(dir.path(), "database/locales/global/en.json");
+        fs::write(dir.path().join("checks.dat"), b"x").unwrap();
+        let manifest = manifest_of(&["database/kept.json"]);
         assert_eq!(
-            keys(dir.path()),
-            vec!["database/locales/global/en.json".to_string()]
+            keys(dir.path(), &manifest),
+            vec!["database/kept.json".to_string()]
         );
-    }
-
-    #[test]
-    fn ignored_dir_rule_is_an_exact_path_match_not_a_name_match() {
-        let dir = TempDir::new().unwrap();
-        touch(dir.path(), "database/locales/server/en.json");
-        touch(dir.path(), "database/other/server/x.json");
-        touch(dir.path(), "database/server.json");
-        let mut expected = vec![
-            "database/other/server/x.json".to_string(),
-            "database/server.json".to_string(),
-        ];
-        expected.sort();
-        assert_eq!(keys(dir.path()), expected);
-    }
-
-    #[test]
-    fn uppercase_json_extension_is_not_collected() {
-        let dir = TempDir::new().unwrap();
-        touch(dir.path(), "database/loud.JSON");
-        touch(dir.path(), "database/quiet.json");
-        assert_eq!(keys(dir.path()), vec!["database/quiet.json".to_string()]);
     }
 
     fn write_manifest(spt_data: &Path, entries: &[(&str, &str)]) {
@@ -366,12 +353,56 @@ mod tests {
     #[tokio::test]
     async fn file_missing_from_manifest_fails() {
         let dir = TempDir::new().unwrap();
+        touch(dir.path(), "database/globals.json");
         touch(dir.path(), "database/extra.json");
-        write_manifest(dir.path(), &[]);
+        write_manifest(
+            dir.path(),
+            &[("database/globals.json", xxh3_hex(b"{}").as_str())],
+        );
         let report = verify(dir.path().to_path_buf()).await;
         assert!(!report.ok);
         assert_eq!(report.failures[0].path, "database/extra.json");
         assert_eq!(report.failures[0].reason, "missing_from_manifest");
+    }
+
+    #[tokio::test]
+    async fn deleted_file_fails_with_missing_from_disk() {
+        let dir = TempDir::new().unwrap();
+        touch(dir.path(), "database/globals.json");
+        write_manifest(
+            dir.path(),
+            &[
+                ("database/globals.json", xxh3_hex(b"{}").as_str()),
+                ("database/deleted.json", xxh3_hex(b"{}").as_str()),
+            ],
+        );
+        let report = verify(dir.path().to_path_buf()).await;
+        assert!(!report.ok);
+        assert_eq!(report.failures[0].path, "database/deleted.json");
+        assert_eq!(report.failures[0].reason, "missing_from_disk");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_replaced_file_fails_instead_of_passing() {
+        let dir = TempDir::new().unwrap();
+        touch(dir.path(), "database/globals.json");
+        write_manifest(
+            dir.path(),
+            &[("database/globals.json", xxh3_hex(b"{}").as_str())],
+        );
+        fs::write(dir.path().join("evil.tmp"), b"{}").unwrap();
+        fs::remove_file(dir.path().join("database/globals.json")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("evil.tmp"),
+            dir.path().join("database/globals.json"),
+        )
+        .unwrap();
+
+        let report = verify(dir.path().to_path_buf()).await;
+        assert!(!report.ok);
+        assert_eq!(report.failures[0].path, "database/globals.json");
+        assert_eq!(report.failures[0].reason, "missing_from_disk");
     }
 
     #[tokio::test]
@@ -385,13 +416,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_collection_fails_instead_of_passing_vacuously() {
+    async fn empty_manifest_fails_instead_of_passing_vacuously() {
         let dir = TempDir::new().unwrap();
         write_manifest(dir.path(), &[]);
         let report = verify(dir.path().to_path_buf()).await;
         assert!(!report.ok);
-        assert_eq!(report.failures[0].path, "database");
-        assert_eq!(report.failures[0].reason, "no verifiable files found");
+        assert_eq!(report.failures[0].path, "checks.dat");
+        assert_eq!(
+            report.failures[0].reason,
+            "manifest_unreadable: manifest is empty"
+        );
     }
 
     #[tokio::test]
