@@ -67,7 +67,12 @@
       >$(SptNativeDir)/target/$(SptNativeTargetTriple)/$(CargoProfile)/$(SptNativeLibName)</SptNativeLibPath>
   </PropertyGroup>
   <Target Name="BuildSptNative" BeforeTargets="AssignTargetPaths">
-    <Exec Command="cargo build $(CargoProfileFlag) $(CargoTargetFlag)" WorkingDirectory="$(SptNativeDir)" ConsoleToMsBuild="true" />
+    <!-- locked: fail fast on Cargo.lock drift instead of silently rewriting it (this fork has no CI to catch that). -->
+    <Exec
+      Command="cargo build --locked $(CargoProfileFlag) $(CargoTargetFlag)"
+      WorkingDirectory="$(SptNativeDir)"
+      ConsoleToMsBuild="true"
+    />
     <ItemGroup>
       <!-- Always, not PreserveNewest: switching $(SptNativeRid) changes the source path, and a
            newer cross-built artifact already in the output dir would otherwise never be replaced. -->
