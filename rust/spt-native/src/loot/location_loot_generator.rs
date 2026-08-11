@@ -1236,12 +1236,10 @@ fn create_dynamic_loot_item(
             format!("Item tpl: {chosen_tpl} cannot be found in database"),
         ));
 
-        // **Deviation.** C# logs the line above and carries on (`:936-940`): every branch below
-        // that would dereference the null template is gated by a base-class test, and those answer
-        // false for a tpl the database has never heard of
-        // (`ItemBaseClassService.cs:97-102`), so the item quietly falls through to the children
-        // branch. A loose loot position naming an unknown tpl is bad data, so it stops the run here
-        // instead of half-building an item.
+        // C# logs the line above (`:939`) and carries on, but it cannot get out of the method: the
+        // base-class gates below all answer false for a tpl the database has never heard of
+        // (`ItemBaseClassService.cs:97-102`), so it reaches `GetItemSize`, which returns null for an
+        // unknown root template (`ItemHelper.cs:1187-1190`), and `size.Width` (`:1012`) throws.
         return Err(LootError::new(format!(
             "Item tpl: {chosen_tpl} cannot be found in database"
         )));
@@ -2211,9 +2209,10 @@ mod tests {
     }
 
     /// Forced loot (two points sharing a template id, one seasonal), a point flagged always-spawn,
-    /// two guaranteed points (money and a weapon with a child mod), a christmas point, a
-    /// blacklisted one, and two weighted points. `mean` 3 with `std` 0 fixes the desired count at 3,
-    /// so exactly one of the two weighted points is drawn.
+    /// five guaranteed points (money, a weapon with a child mod, a magazine and two sharing one
+    /// `locationId`), a christmas point, a blacklisted one, and two weighted points. `mean` 6 with
+    /// `std` 0 fixes the desired count at 6, and the count is taken before the dedupe, so exactly
+    /// one of the two weighted points is drawn.
     fn fixture_dynamic_request() -> DynamicLootRequest {
         let mut always_spawn_point = loose_point(
             "always_1",
@@ -2238,21 +2237,31 @@ mod tests {
                 },
                 WEAPON_TPL: { "parent": WEAPON, "width": 2, "height": 1 },
                 WEAPON_MOD_TPL: { "parent": ITEM_NODE, "width": 1, "height": 1 },
+                MAGAZINE_TPL: {
+                    "parent": MAGAZINE, "width": 1, "height": 2,
+                    "cartridgesMaxCount": 30, "cartridgesFirstFilter": [CARTRIDGE_TPL]
+                },
+                CARTRIDGE_TPL: { "parent": AMMO, "width": 1, "height": 1,
+                    "stackMaxSize": 30, "caliber": CALIBER },
                 FORCED_TPL: { "parent": ITEM_NODE, "width": 1, "height": 1 },
                 PLAIN_TPL: { "parent": ITEM_NODE, "width": 1, "height": 1 },
                 SEASONAL_TPL: { "parent": ITEM_NODE, "width": 1, "height": 1 },
             },
             "defaultPresets": {},
             "moneyTpls": [MONEY_TPL],
-            "staticAmmoDist": {},
+            "staticAmmoDist": {
+                CALIBER: [{ "tpl": CARTRIDGE_TPL, "relativeProbability": 1 }]
+            },
             "config": {
                 "containerRandomisationEnabled": true, "locationInRandomisationMaps": true,
                 "containerTypesToNotRandomise": [], "containerGroupMinSizeMultiplier": 1,
                 "containerGroupMaxSizeMultiplier": 1, "allowDuplicateItemsInStaticContainers": true,
                 "tplsToStripChildItemsFrom": [], "fitLootIntoContainerAttempts": 3,
-                "magazineLootHasAmmoChancePercent": 100,
+                // The two magazine settings the loose path must NOT use are set to fail loudly:
+                // a 0% chance never fills, a 10% fill leaves a third of the stack.
+                "magazineLootHasAmmoChancePercent": 0,
                 "staticMagazineLootHasAmmoChancePercent": 100,
-                "minFillLooseMagazinePercent": 30, "minFillStaticMagazinePercent": 30,
+                "minFillLooseMagazinePercent": 90, "minFillStaticMagazinePercent": 10,
                 "staticLootMultiplier": 1, "looseLootMultiplier": 1,
                 "modSpawnChancePercent": {}, "looseLootBlacklist": ["blacklisted_1"]
             },
@@ -2263,7 +2272,7 @@ mod tests {
             "lootableItemBlacklist": [],
             "counter": { "maxCounts": { SEASONAL_TPL: 5 }, "trackedCounts": {} },
             "looseLoot": {
-                "spawnpointCount": { "mean": 3, "std": 0 },
+                "spawnpointCount": { "mean": 6, "std": 0 },
                 "spawnpointsForced": [
                     loose_point("f1", 1.0, "forced_1", vec![loose_item("fi1", FORCED_TPL)]),
                     // Same template id as the point above, so it is logged and dropped.
@@ -2276,6 +2285,10 @@ mod tests {
                         loose_item("wi1", WEAPON_TPL),
                         loose_child("wi2", WEAPON_MOD_TPL, "wi1"),
                     ]),
+                    loose_point("magazine_1", 1.0, "magazine_1", vec![loose_item("gi1", MAGAZINE_TPL)]),
+                    // Two guaranteed points on one position: only the first may survive the dedupe.
+                    loose_point("shared_location", 1.0, "dupe_first", vec![loose_item("di1", PLAIN_TPL)]),
+                    loose_point("shared_location", 1.0, "dupe_second", vec![loose_item("di2", PLAIN_TPL)]),
                     loose_point("christmas_1", 1.0, "Christmas_1", vec![loose_item("ci1", PLAIN_TPL)]),
                     loose_point("blacklisted_1", 1.0, "blacklisted_1", vec![loose_item("bi1", PLAIN_TPL)]),
                     loose_point("weighted_1", 0.5, "weighted_1", vec![loose_item("wi3", PLAIN_TPL)]),
@@ -2317,8 +2330,8 @@ mod tests {
             );
             // The always-spawn point is forced too, and the main loop must not add it a second time.
             assert_eq!(ids.iter().filter(|id| **id == "always_1").count(), 1);
-            // 2 forced + 2 guaranteed + 1 of the 2 weighted points.
-            assert_eq!(result.spawnpoints.len(), 5, "{ids:?}");
+            // 2 forced + 4 guaranteed (5 less the deduped one) + 1 of the 2 weighted points.
+            assert_eq!(result.spawnpoints.len(), 7, "{ids:?}");
         }
 
         let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
@@ -2385,7 +2398,54 @@ mod tests {
         assert!(!dynamic_tpls(&result).contains(&MONEY_TPL));
         assert!(!dynamic_ids(&result).contains(&"money_1"));
         assert_eq!(result.tracked_counts[MONEY_TPL], 1);
-        assert_eq!(result.spawnpoints.len(), 4);
+        assert_eq!(result.spawnpoints.len(), 6);
+    }
+
+    #[test]
+    fn duplicate_location_ids_keep_the_first_spawn_point() {
+        for _ in 0..25 {
+            let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+            let ids = dynamic_ids(&result);
+
+            // Both points are guaranteed and sit on one position, so only the dedupe can drop one.
+            assert!(ids.contains(&"dupe_first"), "{ids:?}");
+            assert!(!ids.contains(&"dupe_second"), "{ids:?}");
+        }
+    }
+
+    /// The loose path gates on the *static* chance percent and fills to the *loose* minimum
+    /// (`:974-983`); the fixture sets the other two values of the four so that either half of the
+    /// wrong pairing shows up here.
+    #[test]
+    fn magazines_use_the_static_chance_with_the_loose_fill() {
+        for _ in 0..20 {
+            let result = generate_dynamic_loot(fixture_dynamic_request()).unwrap();
+
+            let magazine = result
+                .spawnpoints
+                .iter()
+                .find(|spawnpoint| spawnpoint.id.as_deref() == Some("magazine_1"))
+                .expect("the magazine point spawns at 100%");
+            let items = magazine.items.as_ref().unwrap();
+
+            assert_eq!(items[0].item.template, MAGAZINE_TPL);
+            // The static chance of 100% always fills; the loose chance of 0% never would.
+            assert_eq!(items.len(), 2, "the magazine was not filled");
+            assert_eq!(items[1].item.template, CARTRIDGE_TPL);
+
+            // 90% of the magazine's 30 rounds; the static fill of 10% allows as few as 3.
+            let stack = items[1]
+                .item
+                .upd
+                .as_ref()
+                .unwrap()
+                .stack_objects_count
+                .unwrap();
+            assert!(
+                (27.0..=30.0).contains(&stack),
+                "filled to {stack} rounds, below the loose minimum of 27"
+            );
+        }
     }
 
     #[test]
