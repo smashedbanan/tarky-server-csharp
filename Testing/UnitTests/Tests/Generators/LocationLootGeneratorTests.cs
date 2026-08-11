@@ -161,12 +161,24 @@ public class LocationLootGeneratorTests
         });
 
         TestContext.Out.WriteLine($"checked {checkedCount} of {forced.Count()} forced static entries that spawned with loot");
+
+        // Without this the test passes having asserted nothing: bigmap's one forced entry sits in a
+        // probability-1 container today, but a container that rolled zero loot items trips the filter
+        // above and every assertion silently disappears
+        Assert.That(checkedCount, Is.GreaterThan(0), "no forced static container spawned with loot, so nothing was checked");
     }
 
     /// <summary>
-    /// <c>lootMaxSpawnLimits</c> caps how many of a tpl a raid may contain. The cap is enforced on the
-    /// native side against the counter state handed over in the payload, so a counter that failed to
-    /// carry between the static and dynamic phases would let a limited item over its ceiling.
+    /// <c>lootMaxSpawnLimits</c> caps how many of a tpl a raid may contain, enforced on the native side
+    /// against the counter state handed over in the payload.
+    /// <para>
+    /// Read this as a ceiling check, not as counter coverage. All 11 tpls bigmap limits appear only in
+    /// its loose <c>spawnpointsForced</c>, and 10 of the 11 under a single distinct spawn point template
+    /// id, where the forced-point id dedupe in <c>location_loot_generator.rs:1201-1213</c> already caps
+    /// them at one occurrence with the counter fully broken. Only 683ed6c2e4b1dd7ec4069dc8 has two
+    /// distinct ids, and their probabilities are low enough that it exercises the counter in a low
+    /// single-digit percentage of runs. Nothing here sees the static-to-dynamic counter carry at all.
+    /// </para>
     /// </summary>
     [Test]
     public void SpawnLimitedItemsStayUnderTheirConfiguredMaximum()
@@ -394,7 +406,7 @@ public class LocationLootGeneratorTests
         );
 
 #if !DEBUG
-        Assert.That(mean, Is.LessThanOrEqualTo(CSharpBaselineMs), $"native loot generation is slower than the C# it replaced");
+        Assert.That(mean, Is.LessThanOrEqualTo(CSharpBaselineMs), "native loot generation is slower than the C# it replaced");
 #endif
     }
 }
