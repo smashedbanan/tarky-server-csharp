@@ -1,3 +1,4 @@
+pub mod container_extensions;
 pub mod item_helper;
 pub mod models;
 pub mod mongo_id;
