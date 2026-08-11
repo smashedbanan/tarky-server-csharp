@@ -1,5 +1,10 @@
+using System.Diagnostics;
 using NUnit.Framework;
 using SPTarkov.Server.Core.Generators.Loot;
+using SPTarkov.Server.Core.Models.Common;
+using SPTarkov.Server.Core.Models.Eft.Common;
+using SPTarkov.Server.Core.Models.Spt.Config;
+using SPTarkov.Server.Core.Models.Spt.Tables;
 using SPTarkov.Server.Core.Utils;
 
 namespace UnitTests.Tests.Generators;
@@ -14,8 +19,23 @@ namespace UnitTests.Tests.Generators;
 public class LocationLootGeneratorTests
 {
     private const string LocationId = "bigmap";
+    private const string SmokeLocationId = "factory4_day";
+
+    /// <summary>
+    /// Mean wall-clock of the deleted C# <c>GenerateLocationLoot("bigmap")</c> over 200 Release runs,
+    /// recorded in the Task 12 harness commit af4f5b8c. The native path has to come in under it.
+    /// </summary>
+    private const double CSharpBaselineMs = 929.83;
+
+    private const int TimedRuns = 10;
 
     private LocationLootGenerator _locationLootGenerator = default!;
+    private JsonUtil _jsonUtil = default!;
+    private TemplateTable _templateTable = default!;
+    private LocationTable _locationTable = default!;
+    private LocationConfig _locationConfig = default!;
+
+    private List<SpawnpointTemplate> _spawnpoints = default!;
 
     [OneTimeSetUp]
     public void OneTimeSetUp()
@@ -23,21 +43,26 @@ public class LocationLootGeneratorTests
         var di = DI.GetInstance();
 
         // Publishes the static JsonSerializerOptions SptNative serialises payloads with
-        _ = di.GetService<JsonUtil>();
+        _jsonUtil = di.GetService<JsonUtil>();
 
         _locationLootGenerator = di.GetService<LocationLootGenerator>();
+        _templateTable = di.GetService<TemplateTable>();
+        _locationTable = di.GetService<LocationTable>();
+        _locationConfig = di.GetService<LocationConfig>();
+
+        // One raid's worth of loot, shared by every assertion below - generation is the expensive part
+        _spawnpoints = _locationLootGenerator.GenerateLocationLoot(LocationId);
     }
 
     [Test]
     public void GenerateLocationLootFillsAMapWithStaticAndLooseLoot()
     {
-        var spawnpoints = _locationLootGenerator.GenerateLocationLoot(LocationId);
-
-        var containers = spawnpoints.Where(spawnpoint => spawnpoint.IsContainer ?? false).ToList();
-        var loosePoints = spawnpoints.Where(spawnpoint => !(spawnpoint.IsContainer ?? false)).ToList();
+        var containers = _spawnpoints.Where(spawnpoint => spawnpoint.IsContainer ?? false).ToList();
+        var loosePoints = _spawnpoints.Where(spawnpoint => !(spawnpoint.IsContainer ?? false)).ToList();
 
         Assert.Multiple(() =>
         {
+            Assert.That(_spawnpoints, Is.Not.Empty, "no spawn points at all were generated");
             Assert.That(containers, Is.Not.Empty, "no container spawn points were generated");
             Assert.That(loosePoints, Is.Not.Empty, "no loose loot spawn points were generated");
             Assert.That(
@@ -45,7 +70,140 @@ public class LocationLootGeneratorTests
                 Is.GreaterThan(containers.Count),
                 "no loot went into any container"
             );
-            Assert.That(spawnpoints.All(spawnpoint => spawnpoint.Items?.Any() ?? false), "a spawn point came back with no items at all");
+            Assert.That(_spawnpoints.All(spawnpoint => spawnpoint.Items?.Any() ?? false), "a spawn point came back with no items at all");
+        });
+    }
+
+    /// <summary>
+    /// Every tpl the native side put in the result has to be a real item: a projection that dropped or
+    /// mangled a template id would show up here as loot referencing something the client cannot render.
+    /// </summary>
+    [Test]
+    public void GeneratedItemsOnlyReferenceTemplatesThatExist()
+    {
+        var unknownTpls = _spawnpoints
+            .SelectMany(spawnpoint => spawnpoint.Items!)
+            .Select(item => item.Template)
+            .Distinct()
+            .Where(tpl => !_templateTable.Items.ContainsKey(tpl))
+            .ToList();
+
+        Assert.That(unknownTpls, Is.Empty, "generated loot references templates missing from the items table");
+    }
+
+    /// <summary>
+    /// Ids are minted on the native side; a broken generator or a lost re-root shows up as an id C#
+    /// cannot parse, or as two items in one spawn point sharing an id (which the client treats as one).
+    /// Ids are only unique inside a spawn point - the same spawn point template id legitimately appears
+    /// more than once across the result.
+    /// </summary>
+    [Test]
+    public void GeneratedItemIdsAreValidAndUniqueWithinTheirSpawnpoint()
+    {
+        Assert.Multiple(() =>
+        {
+            foreach (var spawnpoint in _spawnpoints)
+            {
+                var ids = spawnpoint.Items!.Select(item => item.Id.ToString()).ToList();
+
+                Assert.That(ids.All(MongoId.IsValidMongoId), $"spawn point {spawnpoint.Id} has an item id that is not a MongoId");
+                Assert.That(ids.Distinct().Count(), Is.EqualTo(ids.Count), $"spawn point {spawnpoint.Id} reused an item id");
+                Assert.That(
+                    spawnpoint.Root is not null && MongoId.IsValidMongoId(spawnpoint.Root),
+                    $"spawn point {spawnpoint.Id} has no valid root id"
+                );
+                Assert.That(ids, Does.Contain(spawnpoint.Root), $"spawn point {spawnpoint.Id} roots on an item it does not contain");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Quest items forced into a named container have to actually be there, otherwise the quest is
+    /// uncompletable. A container that rolled zero items is skipped before the forced list is read, so
+    /// only containers that got loot are checked.
+    /// </summary>
+    [Test]
+    public void ForcedStaticItemsLandInTheirContainer()
+    {
+        var forced = _locationTable.GetLocation(LocationId)!.StaticContainers!.Value!.StaticForced;
+
+        // A container id can appear more than once in the result - a lookup, not a dictionary
+        var containersById = _spawnpoints
+            .Where(spawnpoint => (spawnpoint.IsContainer ?? false) && spawnpoint.Items!.Count() > 1)
+            .ToLookup(spawnpoint => spawnpoint.Id!, spawnpoint => spawnpoint.Items!.Select(item => item.Template).ToHashSet());
+
+        var checkedCount = 0;
+
+        Assert.Multiple(() =>
+        {
+            foreach (var forcedItem in forced)
+            {
+                // Container did not spawn this raid, or rolled no loot at all
+                foreach (var tpls in containersById[forcedItem.ContainerId])
+                {
+                    checkedCount++;
+                    Assert.That(tpls, Does.Contain(forcedItem.ItemTpl), $"container {forcedItem.ContainerId} is missing its forced item");
+                }
+            }
+        });
+
+        TestContext.Out.WriteLine($"checked {checkedCount} of {forced.Count()} forced static entries that spawned with loot");
+    }
+
+    /// <summary>
+    /// <c>lootMaxSpawnLimits</c> caps how many of a tpl a raid may contain. The cap is enforced on the
+    /// native side against the counter state handed over in the payload, so a counter that failed to
+    /// carry between the static and dynamic phases would let a limited item over its ceiling.
+    /// </summary>
+    [Test]
+    public void SpawnLimitedItemsStayUnderTheirConfiguredMaximum()
+    {
+        var limits = _locationConfig.LootMaxSpawnLimits[LocationId];
+        Assert.That(limits, Is.Not.Empty, "bigmap has no spawn limits configured, this test asserts nothing");
+
+        var counts = _spawnpoints
+            .SelectMany(spawnpoint => spawnpoint.Items!)
+            .Select(item => item.Template)
+            .Where(limits.ContainsKey)
+            .GroupBy(tpl => tpl)
+            .ToDictionary(group => group.Key, group => group.Count());
+
+        Assert.Multiple(() =>
+        {
+            foreach (var (tpl, count) in counts)
+            {
+                Assert.That(count, Is.LessThanOrEqualTo(limits[tpl]), $"tpl {tpl} spawned {count} times, limit is {limits[tpl]}");
+            }
+        });
+    }
+
+    /// <summary>
+    /// The result is handed straight to the client, so anything the native side produced that
+    /// <c>JsonUtil</c> cannot write - a cyclic structure, an unconvertible member - has to fail here.
+    /// </summary>
+    [Test]
+    public void GeneratedLootSerialises()
+    {
+        var json = _jsonUtil.Serialize(_spawnpoints);
+
+        Assert.That(json, Is.Not.Null.And.Not.Empty);
+    }
+
+    /// <summary>
+    /// A second map, to catch anything that only holds for bigmap's data shape.
+    /// </summary>
+    [Test]
+    public void GenerateLocationLootFillsASecondMap()
+    {
+        var spawnpoints = _locationLootGenerator.GenerateLocationLoot(SmokeLocationId);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(spawnpoints, Is.Not.Empty, $"no spawn points were generated for {SmokeLocationId}");
+            Assert.That(
+                spawnpoints.SelectMany(spawnpoint => spawnpoint.Items!).All(item => _templateTable.Items.ContainsKey(item.Template)),
+                $"{SmokeLocationId} loot references templates missing from the items table"
+            );
         });
     }
 
@@ -56,9 +214,40 @@ public class LocationLootGeneratorTests
     [Test]
     public void GenerateLocationLootIsRepeatable()
     {
-        var first = _locationLootGenerator.GenerateLocationLoot(LocationId);
         var second = _locationLootGenerator.GenerateLocationLoot(LocationId);
 
-        Assert.That(second, Has.Count.GreaterThan(first.Count / 2));
+        Assert.That(second, Has.Count.GreaterThan(_spawnpoints.Count / 2));
+    }
+
+    /// <summary>
+    /// The port only pays for itself if it is faster than the C# it replaced. The assertion is compiled
+    /// out of Debug builds: the native library is built with cargo's debug profile there and runs a few
+    /// times slower, which says nothing about the shipped binary. The numbers are logged either way.
+    /// </summary>
+    [Test]
+    public void GenerateLocationLootBeatsTheCSharpBaseline()
+    {
+        // First call pays JIT, the native library load and the LazyLoad materialisation
+        _locationLootGenerator.GenerateLocationLoot(LocationId);
+
+        var timings = new List<double>(TimedRuns);
+        for (var run = 0; run < TimedRuns; run++)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            _locationLootGenerator.GenerateLocationLoot(LocationId);
+            stopwatch.Stop();
+
+            timings.Add(stopwatch.Elapsed.TotalMilliseconds);
+        }
+
+        var mean = timings.Average();
+        TestContext.Out.WriteLine(
+            $"GenerateLocationLoot(\"{LocationId}\") over {TimedRuns} runs: mean {mean:F2} ms, min {timings.Min():F2} ms, "
+                + $"max {timings.Max():F2} ms (C# baseline {CSharpBaselineMs:F2} ms)"
+        );
+
+#if !DEBUG
+        Assert.That(mean, Is.LessThanOrEqualTo(CSharpBaselineMs), $"native loot generation is slower than the C# it replaced");
+#endif
     }
 }
