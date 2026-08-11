@@ -16,6 +16,7 @@ How the SPT server is put together. For build/run commands and contribution rule
 | `Libraries/SPTarkov.Reflection` | Runtime method patching for mods (`AbstractPatch`, `PatchManager`) |
 | `rust/` | Cargo workspace: the `spt-native` cdylib called over C ABI (see Native Rust layer) |
 | `Tools/Ceciler` | Mono.Cecil IL rewriter run on Release builds (see Build-time code generation) |
+| `Patches/Ceciler.JsonExtensionData` | The patch assembly Ceciler applies |
 | `Tools/MongoIdTplGenerator`, `Tools/JsonExtensionDataGenerator`, `Tools/HideoutCraftQuestIdGenerator` | Dev-time one-shot generators |
 | `Testing/UnitTests` | NUnit suite | 
 | `Testing/TestMod`, `Testing/TestMod2` | Reference mod implementations |
@@ -26,7 +27,7 @@ Folder map inside `SPTarkov.Server.Core`: `Callbacks/` (HTTP entry per domain), 
 (`ConfigLoader`, `BundleLoader` — `ModLoader` itself lives in the host at
 `SPTarkov.Server/Modding/`), `Migration/` (profile migrations), `Models/` (`Eft/` mirrors client contracts, `Spt/` is
 server-internal, `Common/` shared primitives), `DI/` (lifecycle interfaces + router base classes),
-`Utils/`, `Constants/`, `Extensions/`, `Exceptions/`.
+`Native/` (the `spt-native` P/Invoke wrapper), `Utils/`, `Constants/`, `Extensions/`, `Exceptions/`.
 
 ## Request pipeline
 
@@ -46,6 +47,11 @@ Kestrel (HTTPS, self-generated cert)
 Routers are declarative: a subclass passes `RouteAction<TRequest>` records to its base constructor
 (see `Routers/Static/WeatherStaticRouter.cs`). Adding an endpoint means touching the router, the
 callback, and usually a controller.
+
+Four routes skip all of this, registered as minimal APIs directly on the `WebApplication`: `/health`
+(`Program.cs`, the Docker health check) and the admin panel's login, logout, and profile-download
+routes (`SPTarkov.Server.Web/SPTWeb.cs`). They are the only `MapGet`/`MapPost` calls in the solution —
+attribute routing is still used nowhere.
 
 The router families under `Routers/`:
 

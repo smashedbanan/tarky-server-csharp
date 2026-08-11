@@ -50,15 +50,16 @@ persistence, websockets, admin panel, mods, build-time codegen. The rules that k
 
 - No MVC controllers or attribute routing. An endpoint = router entry (`Routers/Static` or `Routers/Dynamic`) +
   callback + controller — not an `[HttpGet]`. Item-moving actions go through `Routers/ItemEvents/`; profile-load
-  patches through `Routers/SaveLoad/`.
+  patches through `Routers/SaveLoad/`. Four routes are registered as minimal APIs instead and bypass the pipeline:
+  `/health` (`Program.cs`) and the admin panel's login, logout, and profile-download routes (`SPTarkov.Server.Web/SPTWeb.cs`).
 - Mark classes `[Injectable]`; every registration lives in `ProgramHelpers.RegisterSptServicesAsync`.
   `DependencyInjectionValidationTests` rebuilds that exact container (mods on and off), so a bad registration fails
   the test run, not a launch.
 - Startup work implements `IOnLoad`, ordered by `OnLoadOrder`; anything below `GameCallbacks` runs before Kestrel
   binds. Periodic work implements `IOnUpdate` (5s poll).
-- Never edit `Utils/ProgramStatics.Generated.cs` (build-generated). On Release, `Tools/Ceciler` IL-rewrites
-  `SPTarkov.Server.Core.dll` (injects `[JsonExtensionData]` into `Models` types), so Release and Debug binaries
-  differ structurally.
+- Never edit `Utils/ProgramStatics.Generated.cs` (build-generated). On Release *or any publish*, `Tools/Ceciler`
+  IL-rewrites `SPTarkov.Server.Core.dll` (injects `[JsonExtensionData]` into `Models` types), so a rewritten binary
+  differs structurally from a plain Debug build.
 - The mod-loading split in `Program.StartServerAfterModLoading` is deliberate: merging it back breaks prepatching.
 - `DatabaseImporter` hash-verifies `SPT_Data` against `checks.dat` at startup outside DEBUG builds.
 
