@@ -65,6 +65,8 @@ persistence, websockets, admin panel, mods, build-time codegen. The rules that k
 
 ## Style
 
+**Rust Porting** - Follow the nomenclature and naming scheme of the C# you are replacing.
+
 CSharpier plus `.editorconfig` handle formatting. The rules a formatter can't catch, from CONTRIBUTING.md:
 
 - Always brace single-line bodies.
