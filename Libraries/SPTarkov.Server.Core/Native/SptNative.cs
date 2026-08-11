@@ -29,9 +29,11 @@ public static class SptNative
 {
     private const uint ExpectedAbiVersion = 1;
 
-    public static Task<VerifyResult> VerifyDatabaseAsync(string sptDataDir, CancellationToken cancellationToken = default)
+    // No CancellationToken: the native hash pass is a single bounded blocking call that cannot be
+    // interrupted once in flight, so accepting a token would promise cancellation it can't deliver.
+    public static Task<VerifyResult> VerifyDatabaseAsync(string sptDataDir)
     {
-        return Task.Run(() => VerifyDatabase(sptDataDir), cancellationToken);
+        return Task.Run(() => VerifyDatabase(sptDataDir));
     }
 
     /// <summary>

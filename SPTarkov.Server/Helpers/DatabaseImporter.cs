@@ -33,7 +33,7 @@ public sealed class DatabaseImporter(
 
             if (shouldVerifyDatabase)
             {
-                await VerifyDatabaseAsync(cancellationToken);
+                await VerifyDatabaseAsync();
             }
 
             logger.Info(serverLocalisationService.GetText("importing_database"));
@@ -60,12 +60,12 @@ public sealed class DatabaseImporter(
         }
     }
 
-    private async Task VerifyDatabaseAsync(CancellationToken cancellationToken)
+    private async Task VerifyDatabaseAsync()
     {
         Stopwatch timer = new();
         timer.Start();
 
-        var result = await SptNative.VerifyDatabaseAsync(SptDataPath, cancellationToken);
+        var result = await SptNative.VerifyDatabaseAsync(SptDataPath);
 
         timer.Stop();
         logger.Debug($"Database verification of {result.Checked} files took {timer.ElapsedMilliseconds}ms");
