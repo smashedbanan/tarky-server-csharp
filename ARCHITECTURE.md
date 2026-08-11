@@ -172,26 +172,33 @@ Two non-obvious steps run during build, both in `SPTarkov.Server.Core.csproj`:
 
 ## Native Rust layer
 
-`rust/` is a Cargo workspace with one crate, `spt-native`, built as a `cdylib`. Today it owns exactly
-one job: hashing `SPT_Data` with XXH3-128 and comparing it against `checks.dat`, in parallel on a
+`rust/` is a Cargo workspace with one crate, `spt-native`, built as a `cdylib`. It owns two jobs:
+hashing `SPT_Data` with XXH3-128 and comparing it against `checks.dat`, in parallel on a
 process-wide tokio runtime (`runtime.rs`), replacing the per-file MD5 loop that used to run inside
-the import.
+the import; and generating a location's static and loose loot (`src/loot/`).
 
-Three C-ABI exports (`src/ffi.rs`), consumed by `Libraries/SPTarkov.Server.Core/Native/`:
+Five C-ABI exports (`src/ffi.rs`), consumed by `Libraries/SPTarkov.Server.Core/Native/`:
 
 | Export | Purpose |
 |---|---|
 | `spt_native_abi_version` | `u32` handshake; must equal `SptNative.ExpectedAbiVersion` |
 | `spt_verify_database` | Hashes the tree, returns a heap-allocated JSON `VerifyReport` |
-| `spt_buf_free` | Releases that buffer |
+| `spt_generate_static_containers` | Fills a map's static containers, returns spawn points as JSON |
+| `spt_generate_dynamic_loot` | Picks and fills a map's loose loot spawn points, returns them as JSON |
+| `spt_buf_free` | Releases those buffers |
+
+The two generation exports take the request as UTF-8 JSON and write a buffer on failure as well as
+on success — the error message — so `SptNative.Generate` decides ownership by the out-pointer, never
+by the status code. `SptNative.VerifyDatabase`'s free-on-success-only shape must not be copied into
+them.
 
 `unsafe` is confined to `ffi.rs` (raw pointer in/out) on the Rust side and, on the C# side, to the
-`[LibraryImport]` declarations in `NativeMethods.cs` plus the one `unsafe` method in `SptNative.cs`
-that pins the path, passes the out-params, and reads the returned buffer as a span; `verify.rs`,
-`runtime.rs` and the rest of `SptNative` are safe code. `spt_verify_database` — the only export that
-runs fallible work — wraps it in `catch_unwind` and maps a panic to a status code; the other two
-cannot panic, and `extern "C"` aborts rather than unwinding regardless, so a Rust panic can never
-unwind into the CLR.
+`[LibraryImport]` declarations in `NativeMethods.cs` plus the two `unsafe` methods in `SptNative.cs`
+that pin the input, pass the out-params, and read the returned buffer as a span; `verify.rs`,
+`loot/`, `runtime.rs` and the rest of `SptNative` are safe code. The three exports that run fallible
+work — verification and the two generators — wrap it in `catch_unwind` and map a panic to a status
+code; the other two cannot panic, and `extern "C"` aborts rather than unwinding regardless, so a
+Rust panic can never unwind into the CLR.
 `DatabaseImporter.LoadDatabaseAsync` calls `SptNative.EnsureLoadable()` on every startup — including
 DEBUG builds that skip verification — so a missing or ABI-mismatched library fails fast at startup
 rather than at first use.
@@ -213,8 +220,80 @@ copied to every referencing project's output. Cross-RID builds must pass `-p:Spt
 to a Rust target triple, and `SPTarkov.Server.csproj` errors out for RIDs with no mapping instead of
 shipping a wrong-triple library. Only `linux-x64` is mapped — arm64 is not a supported target.
 
+### Location loot generation
+
+`Generators/Loot/LocationLootGenerator` is `[Injectable]` and keeps the pre-port signatures of its
+three public methods (`GenerateLocationLoot`, `GenerateStaticContainers`, `GenerateDynamicLoot`),
+but holds no generation logic. Each call projects the live database, config and services into a JSON
+payload, hands it to `spt_generate_static_containers` or `spt_generate_dynamic_loot`, and replays
+the log lines the native side collected instead of writing itself — `ReplayDiagnostics` resolves a
+level plus a locale key and its args back through `ServerLocalisationService`. Rolling, packing and
+item assembly live in `rust/spt-native/src/loot/`; `Native/Loot/LootPayloads.cs` mirrors
+`loot/models.rs` member for member, and those Rust models carry a `#[serde(flatten)] extra` map so
+mod-added fields survive the round trip. `CounterTrackerHelper` state crosses in both directions, so
+per-location spawn limits span the static and dynamic phases of one raid.
+
+How the payload is sourced decides how much of the old extension surface survives:
+
+- Nothing is cached between calls. A swapped item, an edited config value or a changed seasonal
+  state is picked up on the next raid.
+- The items view is one pass over `TemplateTable.Items`, not per-item `ItemHelper.GetItem` calls.
+  Templates without `_props` are dropped — their absence is how the native side says "lacks props".
+- The blacklist is `ItemFilterService.GetLootableItemBlacklistCache()`, not the config list, so
+  runtime `AddItemToLootableBlacklistCache` additions count; default presets come from
+  `PresetHelper.GetDefaultPresetByTpl()`, which reproduces `GetDefaultPreset` semantics in bulk.
+- The loose- and static-loot multipliers are resolved to one number per location in C#; they are
+  deliberately not native functions.
+
+**Two loose-loot paths.** `GenerateDynamicLoot`'s `dynamicLootDist` is nullable: null means "use the
+location's `looseLoot.json` as the raw bytes it sits on disk as", which `LooseLootPayload` splices
+into the request unparsed. `GenerateLocationLoot` takes that path whenever the location's `LooseLoot`
+`LazyLoad` has no registered transformer — with none registered the raw file is if anything the more
+faithful input, since explicit nulls and members the C# models do not declare survive it. Any
+registered transformer (a seasonal event registers one during the christmas windows; a mod can too)
+forces the typed path, which parses and re-encodes 42 MB for `bigmap`: ~1347 ms per raid start
+against ~345 ms raw, versus 929.83 ms for the C# it replaced. That cost is the accepted ceiling of
+the typed path, and why `GenerateLocationLootBeatsTheCSharpBaseline` pins its timed section to the
+raw path. `PostDbLoadService` registers its loot-adjustment transformers only for maps whose
+`loot.json` entry is non-empty (vanilla has six empty ones), so a default install stays on the raw
+path. Calling `GenerateDynamicLoot(null, …)` for a location with no raw bytes, or one that has a
+transformer, throws rather than generating from nothing.
+
+**Preserved for mods.**
+
+- Replacing `LocationLootGenerator` through DI — register a subclass at a higher `TypePriority`, as
+  with any service — and runtime patches on its three public methods, arguments and results
+  included.
+- Every form of data mutation: database tables, `SPT_Data` JSON, the configs the payload reads, and
+  `LazyLoad` transformers, which are the supported channel for changing loose loot.
+- Overrides of the services the payload is built from — `ItemFilterService`, `PresetHelper`,
+  `SeasonalEventService`, `CounterTrackerHelper`'s state accessors, `ServerLocalisationService` —
+  all queried live while the payload is built.
+- Fields the C# and Rust models do not declare, on both the request and the result.
+
+**Broken for mods.**
+
+- The 16 protected methods that used to hold the generation logic are gone. A subclass overriding
+  them fails to compile and a patch naming them fails to apply, rather than silently doing nothing.
+- The constructor no longer takes `RandomUtil` and now takes `TemplateTable` — visible to subclasses
+  at compile time.
+- `RandomUtil` overrides do not affect loot rolls: every roll happens natively.
+- `ItemHelper` overrides are bypassed inside loot generation (only `GetMoneyTpls` is still called
+  through it) — database edits still land, assembly-level overrides do not.
+- `CounterTrackerHelper.IncrementCount` is not invoked per item; only the counts round-trip, so
+  per-item logic patched into it never runs during generation.
+- A patch on `GenerateDynamicLoot` that mutates the `looseLoot` **argument** is not honoured on the
+  raw path, where that argument is null. Register a `LazyLoad` transformer instead — which also puts
+  that map on the typed path.
+- Reading `DynamicLootRequest.LooseLoot` gets a `LooseLootPayload`, not a `LooseLoot` (a `LooseLoot`
+  assigned to it converts implicitly). Source-compatible for writers, not for readers.
+- Returned spawn points are freshly deserialised objects, not reference-identical to anything inside
+  the caller's `LooseLoot`. Code that watched for in-place mutation of the input sees none.
+- When generation fails the diagnostics collected before the failure are dropped: C# throws with the
+  native error message alone. An inherited limit of the one-buffer FFI contract.
+
 **Rule for future ports.** A static wrapper like `SptNative` is acceptable only for startup-internal
-subsystems that mods never touch. Anything mods can override or patch — loose-loot, bot and ragfair
-generation are the intended next ports — must stay an `[Injectable]` service behind an interface,
-resolved through DI and overridable by `TypePriority`, with the Rust call made from inside it. A
-static class cannot be overridden, mocked, or patched by `SPTarkov.Reflection`.
+subsystems that mods never touch. Anything mods can override or patch — bot and ragfair generation
+are the intended next ports — must stay an `[Injectable]` service resolved through DI and
+overridable by `TypePriority`, with the Rust call made from inside it, as `LocationLootGenerator`
+does. A static class cannot be overridden, mocked, or patched by `SPTarkov.Reflection`.
