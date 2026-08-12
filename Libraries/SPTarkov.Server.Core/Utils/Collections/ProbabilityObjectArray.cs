@@ -158,7 +158,7 @@ public class ProbabilityObjectArray<K, V> : List<ProbabilityObject<K, V>>
         // Loop until we've picked to desired item count
         for (var i = 0; i < itemCountToDraw; i++)
         {
-            var rand = Random.Shared.NextDouble();
+            var rand = ProbabilityRandomSource.Current.NextDouble53();
             var randomIndex = cumulativeProbabilities.FindIndex(probability => probability >= rand);
 
             if (randomIndex == -1)
@@ -199,7 +199,7 @@ public class ProbabilityObjectArray<K, V> : List<ProbabilityObject<K, V>>
         for (var i = 0; i < itemCountToDraw && availableItems.Any(); i++)
         {
             // Get value between 0 and 1 to act as a target to aim for
-            var randomTarget = Random.Shared.NextDouble() * totalWeight;
+            var randomTarget = ProbabilityRandomSource.Current.NextDouble53() * totalWeight;
 
             // Set default index to start
             var chosenIndex = -1;

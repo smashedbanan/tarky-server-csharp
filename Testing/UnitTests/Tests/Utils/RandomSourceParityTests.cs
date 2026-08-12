@@ -1,5 +1,7 @@
 using NUnit.Framework;
 using SPTarkov.Server.Core.Utils;
+using SPTarkov.Server.Core.Utils.Cloners;
+using SPTarkov.Server.Core.Utils.Collections;
 
 namespace UnitTests.Tests.Utils;
 
@@ -29,6 +31,12 @@ public sealed class RandomSourceParityTests
     ///     Pinned for the RandomUtil.GetDouble twin added alongside the seeded RandomUtil wiring.
     /// </summary>
     private static readonly ulong[] _katGetDouble0To100Bits = [0x401177F309171260UL, 0x40553E20A6AEB64EUL, 0x40403FCF4EA60172UL];
+
+    private static readonly bool[] _katGetChance100At50 = [true, true, true, false, false];
+
+    private static readonly string[] _katPoolDraw5 = ["a", "a", "a", "c", "c"];
+
+    private static readonly string[] _katPoolDrawAndRemove3 = ["a", "b", "c"];
 
     [Test]
     public void RawXoshiroSequenceMatchesTheRustTwin()
@@ -77,6 +85,59 @@ public sealed class RandomSourceParityTests
         for (var i = 0; i < _katGetInt1To10.Length; i++)
         {
             Assert.That(source.GetInt32(1, 11), Is.EqualTo(_katGetInt1To10[i]), $"GetInt32 #{i}");
+        }
+    }
+
+    [Test]
+    public void SeededRandomUtilMatchesTheRustDrawScript()
+    {
+        var randomUtil = DI.GetInstance().GetService<RandomUtil>();
+        var original = randomUtil.RandomSource;
+        try
+        {
+            randomUtil.RandomSource = new SeededRandomSource(KatSeed);
+            for (var i = 0; i < _katGetInt1To10.Length; i++)
+            {
+                Assert.That(randomUtil.GetInt(1, 10), Is.EqualTo(_katGetInt1To10[i]), $"GetInt #{i}");
+            }
+
+            randomUtil.RandomSource = new SeededRandomSource(KatSeed);
+            for (var i = 0; i < _katGetDouble0To100Bits.Length; i++)
+            {
+                var bits = BitConverter.DoubleToUInt64Bits(randomUtil.GetDouble(0, 100));
+                Assert.That(bits, Is.EqualTo(_katGetDouble0To100Bits[i]), $"GetDouble #{i}");
+            }
+
+            randomUtil.RandomSource = new SeededRandomSource(KatSeed);
+            for (var i = 0; i < _katGetChance100At50.Length; i++)
+            {
+                Assert.That(randomUtil.GetChance100(50), Is.EqualTo(_katGetChance100At50[i]), $"GetChance100 #{i}");
+            }
+        }
+        finally
+        {
+            randomUtil.RandomSource = original;
+        }
+    }
+
+    [Test]
+    public void SeededProbabilityObjectArrayMatchesTheRustPoolDraws()
+    {
+        var cloner = DI.GetInstance().GetService<ICloner>();
+        var pool = new ProbabilityObjectArray<string, string>(cloner) { new("a", 5, null), new("b", 1, null), new("c", 1, null) };
+
+        var original = ProbabilityRandomSource.Current;
+        try
+        {
+            ProbabilityRandomSource.Current = new SeededRandomSource(KatSeed);
+            Assert.That(pool.Draw(5), Is.EqualTo(_katPoolDraw5));
+
+            ProbabilityRandomSource.Current = new SeededRandomSource(KatSeed);
+            Assert.That(pool.DrawAndRemove(3), Is.EqualTo(_katPoolDrawAndRemove3));
+        }
+        finally
+        {
+            ProbabilityRandomSource.Current = original;
         }
     }
 }

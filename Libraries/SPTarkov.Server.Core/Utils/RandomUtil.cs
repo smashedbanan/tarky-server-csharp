@@ -1,6 +1,4 @@
-using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
-using System.Security.Cryptography;
 using SPTarkov.Common.Extensions;
 using SPTarkov.Common.Models.Logging;
 using SPTarkov.DI.Annotations;
@@ -11,11 +9,6 @@ namespace SPTarkov.Server.Core.Utils;
 [Injectable(InjectionType.Singleton)]
 public sealed class RandomUtil(ISptLogger<RandomUtil> logger, ICloner cloner)
 {
-    /// <summary>
-    /// Max value at 2^48
-    /// </summary>
-    private const double MaxRandomValue = 281474976710656.0;
-
     private const int DecimalPointRandomPrecision = 6;
 
     /// <summary>
@@ -23,6 +16,12 @@ public sealed class RandomUtil(ISptLogger<RandomUtil> logger, ICloner cloner)
     ///     integer + fractional parts) to about 15–17 significant digits. 15 is a safe upper bound, so we'll use that.
     /// </summary>
     public const int MaxSignificantDigits = 15;
+
+    /// <summary>
+    ///     The primitive draws behind every public member. Production leaves the crypto default in
+    ///     place; tests swap in a <see cref="SeededRandomSource"/> and restore it in a finally.
+    /// </summary>
+    internal IRandomSource RandomSource { get; set; } = CryptoRandomSource.Instance;
 
     /// <summary>
     ///     Generates a random integer between the specified minimum and maximum values, inclusive.
@@ -46,7 +45,7 @@ public sealed class RandomUtil(ISptLogger<RandomUtil> logger, ICloner cloner)
             max -= 1;
         }
 
-        return max > min ? RandomNumberGenerator.GetInt32(min, exclusive ? max : max + 1) : min;
+        return max > min ? RandomSource.GetInt32(min, exclusive ? max : max + 1) : min;
     }
 
     /// <summary>
@@ -92,7 +91,7 @@ public sealed class RandomUtil(ISptLogger<RandomUtil> logger, ICloner cloner)
 
     public void NextBytes(Span<byte> bytes)
     {
-        RandomNumberGenerator.Fill(bytes);
+        RandomSource.Fill(bytes);
     }
 
     /// <summary>
@@ -257,11 +256,11 @@ public sealed class RandomUtil(ISptLogger<RandomUtil> logger, ICloner cloner)
         // Return a random integer from 0 to low if high is not provided
         if (high is null)
         {
-            return RandomNumberGenerator.GetInt32(0, low);
+            return RandomSource.GetInt32(0, low);
         }
 
         // Return low directly when low and high are equal
-        return low == high ? low : RandomNumberGenerator.GetInt32(low, (int)high);
+        return low == high ? low : RandomSource.GetInt32(low, (int)high);
     }
 
     /// <summary>
@@ -464,17 +463,7 @@ public sealed class RandomUtil(ISptLogger<RandomUtil> logger, ICloner cloner)
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public double GetSecureRandomNumber()
     {
-        Span<byte> buffer = stackalloc byte[8];
-        RandomNumberGenerator.Fill(buffer);
-
-        var value = BinaryPrimitives.ReadInt64BigEndian(buffer) & 0x0000_FFFF_FFFF_FFFF;
-
-        if (value == 0L)
-        {
-            value = 1L;
-        }
-
-        return value / MaxRandomValue;
+        return RandomSource.NextDouble48();
     }
 
     /// <summary>
