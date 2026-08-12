@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Configuration;
+﻿using System.Reflection;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using NUnit.Framework;
@@ -33,7 +34,7 @@ public class DI
         return _instance ??= new DI();
     }
 
-    private DatabaseTables SetupDB(IReadOnlyDictionary<Type, BaseConfig> configuration, LocaleTable locales, ILogger logger)
+    private static DatabaseTables SetupDB(IReadOnlyDictionary<Type, BaseConfig> configuration, LocaleTable locales, ILogger logger)
     {
         var services = new ServiceCollection();
 
@@ -66,6 +67,16 @@ public class DI
             return;
         }
 
+        _serviceProvider = BuildIsolatedProvider();
+    }
+
+    /// <summary>
+    /// Builds a fully loaded provider (config, locales, database, all Core injectables, IOnLoad run),
+    /// optionally scanning extra mod assemblies. Callers own disposal. Used by the shared singleton
+    /// above and by fixtures that need an isolated container mod registrations can't leak out of.
+    /// </summary>
+    internal static IServiceProvider BuildIsolatedProvider(params Assembly[] modAssemblies)
+    {
         var mockLogger = new MockLogger<DI>();
         var configuration = ConfigLoader.Initialize(mockLogger).GetAwaiter().GetResult();
 
@@ -97,19 +108,25 @@ public class DI
         var diHandler = new DependencyInjectionHandler(services);
 
         diHandler.AddInjectableTypesFromTypeAssembly(typeof(SPTStartupHostedService));
+        foreach (var modAssembly in modAssemblies)
+        {
+            diHandler.AddInjectableTypesFromAssembly(modAssembly);
+        }
 
         diHandler.InjectAll();
 
         services.AddSingleton<IReadOnlyList<SptMod>>(_ => []);
 
-        _serviceProvider = services.BuildServiceProvider();
+        var serviceProvider = services.BuildServiceProvider();
 
         var cancellationTokenSource = new CancellationTokenSource();
 
-        foreach (var onLoad in _serviceProvider.GetServices<IOnLoad>())
+        foreach (var onLoad in serviceProvider.GetServices<IOnLoad>())
         {
             onLoad.OnLoadAsync(cancellationTokenSource.Token).Wait();
         }
+
+        return serviceProvider;
     }
 
     public T GetService<T>()
