@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using NUnit.Framework;
+using SPTarkov.Server.Core.DI;
 using SPTarkov.Server.Core.Utils;
 using TestMod;
 
@@ -34,5 +35,21 @@ public class ModCompatibilityTests
         var watermark = _provider.GetRequiredService<Watermark>();
 
         Assert.That(watermark.GetType(), Is.EqualTo(typeof(TestModWatermarkOverride)));
+    }
+
+    [Test]
+    public void ModImplementingIOnUpdate_IsRegisteredInTheUpdateCollection()
+    {
+        var updatables = _provider.GetServices<IOnUpdate>();
+
+        Assert.That(updatables.Any(updatable => updatable is TestModOnUpdate), Is.True);
+    }
+
+    [Test]
+    public void ModStaticRouter_IsRegisteredInTheRouterCollection()
+    {
+        var routers = _provider.GetServices<StaticRouter>();
+
+        Assert.That(routers.Any(router => router.CanHandle("/testmod/ping")), Is.True);
     }
 }

@@ -9,6 +9,7 @@ using SPTarkov.Server;
 using SPTarkov.Server.Core.DI;
 using SPTarkov.Server.Core.Loaders;
 using SPTarkov.Server.Core.Models.Spt.Config;
+using SPTarkov.Server.Core.Models.Spt.Launcher;
 using SPTarkov.Server.Core.Models.Spt.Mod;
 using SPTarkov.Server.Core.Models.Spt.Tables;
 using SPTarkov.Server.Core.Services.Hosted;
@@ -87,6 +88,7 @@ public class DI
         services.AddSingleton(typeof(ISptLogger<>), typeof(MockLogger<>));
         services.AddHttpContextAccessor();
         services.AddHttpClient();
+        services.AddSingleton(new ClientEnumDefinitions());
 
         var locales = ProgramHelpers.CreateEarlyLocaleTable() ?? throw new InvalidOperationException("Locales aren't loaded lmao");
         var db = SetupDB(configuration, locales, mockLogger);
@@ -119,6 +121,7 @@ public class DI
         services.AddModDIConstructorsAsync(modAssemblies).GetAwaiter().GetResult();
 
         services.AddSingleton<IReadOnlyList<SptMod>>(_ => []);
+        services.AddSingleton<IReadOnlyList<ModPage>>(_ => []);
 
         var serviceProvider = services.BuildServiceProvider();
 

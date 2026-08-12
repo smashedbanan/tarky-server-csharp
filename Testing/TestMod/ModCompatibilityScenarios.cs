@@ -18,3 +18,19 @@ public class TestModWatermarkOverride(
     WatermarkLocale watermarkLocale,
     CoreConfig coreConfig
 ) : Watermark(logger, serverLocalisationService, watermarkLocale, coreConfig);
+
+[Injectable(InjectionType.Singleton)]
+public class TestModOnUpdate : IOnUpdate
+{
+    public Task<bool> OnUpdateAsync(long secondsSinceLastRun, CancellationToken cancellationToken)
+    {
+        return Task.FromResult(true);
+    }
+}
+
+[Injectable(TypePriority = OnLoadOrder.Routers)]
+public class TestModStaticRouter(JsonUtil jsonUtil)
+    : StaticRouter(
+        jsonUtil,
+        [new RouteAction("/testmod/ping", (url, info, sessionId, output, cancellationToken) => new ValueTask<object>("pong"))]
+    );
