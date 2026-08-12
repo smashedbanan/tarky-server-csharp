@@ -102,6 +102,16 @@ public class ItemHelper(
     protected static readonly FrozenSet<MongoId> _armorSlotsThatCanHoldMods = [BaseClasses.HEADWEAR, BaseClasses.VEST, BaseClasses.ARMOR];
 
     /// <summary>
+    ///     The live items table, for same-assembly callers that hold an ItemHelper but not the table
+    ///     itself — LocationLootGenerator's constructor is frozen to its 4.1.2 signature, which
+    ///     predates TemplateTable injection.
+    /// </summary>
+    internal TemplateTable TemplateTable
+    {
+        get { return templateTable; }
+    }
+
+    /// <summary>
     /// Does the provided pool of items contain the desired item
     /// </summary>
     /// <param name="itemPool">Item collection to check</param>
