@@ -31,10 +31,7 @@ public class LootHookLivenessTests
     public void HarmonyPatchOnAProtectedMemberFiresAndForcesTheLegacyPath()
     {
         var harmony = new Harmony("unit-tests.loot-hook-liveness");
-        var target = typeof(LocationLootGenerator).GetMethod(
-            "CreateStaticLootItem",
-            BindingFlags.Instance | BindingFlags.NonPublic
-        );
+        var target = typeof(LocationLootGenerator).GetMethod("CreateStaticLootItem", BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.That(target, Is.Not.Null, "restored protected member CreateStaticLootItem not found");
 
         _patchFired = false;
