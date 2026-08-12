@@ -272,9 +272,12 @@ public class LocationLootGeneratorNativeTests
             // Guards the fixture itself: one spawnpoint means only the guaranteed container came
             // back and the container-group path never ran, which would make the comparison hollow.
             Assert.That(resultA.Spawnpoints, Has.Count.GreaterThan(1), $"seed {seed} never reached the container-group path");
+            Assert.That(resultA.TrackedCounts, Is.Not.Empty, $"seed {seed} left trackedCounts out of the comparison");
+            // The whole result, not just the spawnpoints: `trackedCounts` is the other map whose
+            // iteration order the seed has to pin down, and the counts ride along with it.
             Assert.That(
-                StripMongoIds(_jsonUtil.Serialize(resultA.Spawnpoints)!),
-                Is.EqualTo(StripMongoIds(_jsonUtil.Serialize(resultB.Spawnpoints)!)),
+                StripMongoIds(_jsonUtil.Serialize(resultA)!),
+                Is.EqualTo(StripMongoIds(_jsonUtil.Serialize(resultB)!)),
                 $"seed {seed} did not reproduce"
             );
         }
@@ -310,6 +313,14 @@ public class LocationLootGeneratorNativeTests
                 ["r2"] = new ContainerData { GroupId = "g1" },
                 ["r3"] = new ContainerData { GroupId = "g2" },
             },
+        };
+
+        // Ceilings high enough never to bite, purely so tpls land in `trackedCounts` — it stays
+        // empty under the base fixture, which would hide its ordering from the comparison.
+        request.Counter = new CounterState
+        {
+            MaxCounts = new Dictionary<MongoId, int> { [_moneyTpl] = 9999, [_containerTpl] = 9999 },
+            TrackedCounts = [],
         };
 
         return request;

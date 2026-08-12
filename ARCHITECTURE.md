@@ -357,10 +357,13 @@ binary compatibility with mods compiled against the frozen 4.1.2 assemblies, enf
    optional `testSeed` request field (safe because each generation call runs synchronously on
    the calling thread). Identical derivation functions on both sides are pinned bit-for-bit by
    twin known-answer tests (`RandomSourceParityTests.cs` / the KAT tests in `random_util.rs`).
-   Production randomness is untouched: crypto statics on C#, thread entropy in Rust. Still
-   pending: full-output golden tests — same seed, bit-identical loot output with the retained
-   legacy path as the executable oracle — which additionally require draw-order alignment
-   between the legacy and native paths.
+   Production randomness is unchanged on the C# side, bit-for-bit — the same
+   `RandomNumberGenerator`/`Random.Shared` statics behind the default source. Rust production
+   keeps thread entropy but now draws through the shared derivations, so its distributions
+   match the C# it ports (including `get_int`'s `int.MaxValue` fold) while its unseeded
+   sequences differ from pre-port ones. Still pending: full-output golden tests — same seed,
+   bit-identical loot output with the retained legacy path as the executable oracle — which
+   additionally require draw-order alignment between the legacy and native paths.
 4. **FFI/ABI.** The JSON payload envelopes are internal contracts between this repo's C# and this
    repo's Rust, shipped in lockstep — change them freely, bump `spt_native_abi_version` every
    time. No third-party consumer of the cdylib is supported; the only frozen contract is the

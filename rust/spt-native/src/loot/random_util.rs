@@ -19,22 +19,25 @@ thread_local! {
 /// Routes every draw on this thread through a seeded xoshiro256** until dropped. Installed by the
 /// `testSeed` request field at the FFI entry points; RAII so a panic during generation cannot leak
 /// a seeded state onto a pooled thread.
-pub struct TestSeedGuard;
+#[must_use = "the seeded override is uninstalled as soon as the guard is dropped"]
+pub struct TestSeedGuard {
+    /// Whatever occupied the slot before this guard, restored on drop rather than cleared, so a
+    /// nested install cannot silently drop its caller back to entropy.
+    previous: Option<Xoshiro256StarStar>,
+}
 
 impl TestSeedGuard {
     pub fn install(seed: u64) -> Self {
-        TEST_RNG.with(|slot| {
-            *slot.borrow_mut() = Some(xoshiro_from_u64(seed));
-        });
+        let previous = TEST_RNG.with(|slot| slot.borrow_mut().replace(xoshiro_from_u64(seed)));
 
-        Self
+        Self { previous }
     }
 }
 
 impl Drop for TestSeedGuard {
     fn drop(&mut self) {
         TEST_RNG.with(|slot| {
-            *slot.borrow_mut() = None;
+            *slot.borrow_mut() = self.previous.take();
         });
     }
 }

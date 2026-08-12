@@ -114,6 +114,11 @@ internal sealed class SeededRandomSource(ulong seed) : IRandomSource
 
     public int GetInt32(int fromInclusive, int toExclusive)
     {
+        if (toExclusive <= fromInclusive)
+        {
+            throw new ArgumentOutOfRangeException(nameof(fromInclusive));
+        }
+
         var range = (ulong)((long)toExclusive - fromInclusive);
         return (int)(fromInclusive + (long)NextBelow(range));
     }

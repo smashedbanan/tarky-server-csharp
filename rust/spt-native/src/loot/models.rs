@@ -502,7 +502,8 @@ pub struct DynamicLootResult {
 mod tests {
     use super::*;
 
-    /// Every `LootCommon` member, for splicing into an envelope test literal.
+    /// Every required `LootCommon` member, for splicing into an envelope test literal. `testSeed`
+    /// is deliberately absent — its omission is what exercises the missing-field → `None` path.
     const COMMON_JSON: &str = r#"
         "locationId":"bigmap",
         "itemsView":{"aaaaaaaaaaaaaaaaaaaaaaaa":{"parent":"bbbbbbbbbbbbbbbbbbbbbbbb","width":2,"height":1,

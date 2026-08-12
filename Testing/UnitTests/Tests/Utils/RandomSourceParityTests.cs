@@ -89,6 +89,15 @@ public sealed class RandomSourceParityTests
     }
 
     [Test]
+    public void GetInt32RejectsAnEmptyRangeAsRandomNumberGeneratorDoes()
+    {
+        var source = new SeededRandomSource(KatSeed);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => source.GetInt32(5, 5));
+        Assert.Throws<ArgumentOutOfRangeException>(() => source.GetInt32(5, 4));
+    }
+
+    [Test]
     public void SeededRandomUtilMatchesTheRustDrawScript()
     {
         var randomUtil = DI.GetInstance().GetService<RandomUtil>();
