@@ -3,4 +3,4 @@ pub mod loot;
 pub mod runtime;
 pub mod verify;
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;

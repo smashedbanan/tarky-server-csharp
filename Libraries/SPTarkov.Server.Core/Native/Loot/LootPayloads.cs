@@ -55,6 +55,13 @@ public record LootCommon
 
     [JsonPropertyName("counter")]
     public required CounterState Counter { get; set; }
+
+    /// <summary>
+    /// Test-only: draws on the native side come from a seeded generator when set. Null — and
+    /// therefore omitted from the wire JSON — on the production path.
+    /// </summary>
+    [JsonPropertyName("testSeed")]
+    public ulong? TestSeed { get; set; }
 }
 
 /// <summary>

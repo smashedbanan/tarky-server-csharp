@@ -59,6 +59,11 @@ public class LocationLootGenerator(
     internal LootGenerationPath LastPathTaken { get; private set; }
 
     /// <summary>
+    ///     Test-only seed forwarded as <see cref="LootCommon.TestSeed"/> on both native requests.
+    /// </summary>
+    internal ulong? NativeTestSeed { get; set; }
+
+    /// <summary>
     ///     The 4.1.2 members a mod can Harmony-patch. Protected and declared on this class - exactly
     ///     the surface the apicompat gate freezes. Computed once; patches come and go per call, so
     ///     the check itself does not.
@@ -183,6 +188,7 @@ public class LocationLootGenerator(
                 Seasonal = common.Seasonal,
                 LootableItemBlacklist = common.LootableItemBlacklist,
                 Counter = common.Counter,
+                TestSeed = NativeTestSeed,
                 // Nulls are passed through, not replaced with empty lists - the native side logs a
                 // map-specific error for each missing list
                 StaticWeapons = staticContainerDetails.StaticWeapons,
@@ -243,6 +249,7 @@ public class LocationLootGenerator(
                 Seasonal = common.Seasonal,
                 LootableItemBlacklist = common.LootableItemBlacklist,
                 Counter = common.Counter,
+                TestSeed = NativeTestSeed,
                 // The caller's loot data, so any transformer or patch applied to it is honoured
                 LooseLoot = dynamicLootDist is null ? RawLooseLootJson(locationName) : dynamicLootDist,
             }

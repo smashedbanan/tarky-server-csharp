@@ -337,6 +337,9 @@ pub struct LootCommon {
     pub seasonal: SeasonalView,
     pub lootable_item_blacklist: HashSet<String>,
     pub counter: CounterState,
+    /// Test-only: when present, every draw comes from a seeded xoshiro256** for the duration of
+    /// the call (see `random_util::TestSeedGuard`). Never set on the production path.
+    pub test_seed: Option<u64>,
 }
 
 /// The slice of `TemplateItem` the generator actually reads, flattened by the C# caller.

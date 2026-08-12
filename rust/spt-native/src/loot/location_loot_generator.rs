@@ -6,7 +6,7 @@
 //! and crashes), the port returns a [`LootError`] rather than panicking behind the FFI boundary —
 //! each such site names the C# line it stands in for.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::json;
 
@@ -27,7 +27,10 @@ use super::{mongo_id, random_util};
 /// seeded with -1 and every other value comes out of `GetInt`.
 #[derive(Debug, Clone, Default)]
 struct ContainerGroupCount {
-    container_ids_with_probability: HashMap<String, f64>,
+    /// `BTreeMap`, not `HashMap`: the iteration order decides both the order containers are rolled
+    /// in and the order they enter the probability array, so a randomised order would leave the
+    /// draw non-reproducible even under a fixed `test_seed`.
+    container_ids_with_probability: BTreeMap<String, f64>,
     chosen_count: f64,
 }
 
@@ -119,6 +122,11 @@ fn into_result(
 pub fn generate_static_containers(
     mut request: StaticContainersRequest,
 ) -> Result<StaticContainersResult, LootError> {
+    let _seed_guard = request
+        .common
+        .test_seed
+        .map(random_util::TestSeedGuard::install);
+
     // Everything the run mutates is moved out before the rest of the request is lent to the context.
     let counter = std::mem::take(&mut request.common.counter);
     let static_weapons = request.static_weapons.take();
@@ -464,12 +472,12 @@ fn get_group_id_to_container_mappings(
     ctx: &mut LootContext,
     static_container_group_data: &StaticContainer,
     static_containers_on_map: &[&StaticContainerData],
-) -> HashMap<String, ContainerGroupCount> {
+) -> BTreeMap<String, ContainerGroupCount> {
     let config = ctx.config;
 
     // Create dictionary of all group ids and choose a count of containers the map will spawn of
     // that group
-    let mut mapping: HashMap<String, ContainerGroupCount> = HashMap::new();
+    let mut mapping: BTreeMap<String, ContainerGroupCount> = BTreeMap::new();
     for (container_group_id, container_min_max) in static_container_group_data
         .containers_groups
         .iter()
@@ -482,7 +490,7 @@ fn get_group_id_to_container_mappings(
         mapping.insert(
             container_group_id.clone(),
             ContainerGroupCount {
-                container_ids_with_probability: HashMap::new(),
+                container_ids_with_probability: BTreeMap::new(),
                 chosen_count: f64::from(random_util::get_int(
                     random_util::round_half_even(min * config.container_group_min_size_multiplier)
                         as i32,
@@ -498,7 +506,7 @@ fn get_group_id_to_container_mappings(
     mapping.insert(
         String::new(),
         ContainerGroupCount {
-            container_ids_with_probability: HashMap::new(),
+            container_ids_with_probability: BTreeMap::new(),
             chosen_count: -1.0,
         },
     );
@@ -877,6 +885,11 @@ fn is_always_spawn(spawn_point: &Spawnpoint) -> bool {
 pub fn generate_dynamic_loot(
     mut request: DynamicLootRequest,
 ) -> Result<DynamicLootResult, LootError> {
+    let _seed_guard = request
+        .common
+        .test_seed
+        .map(random_util::TestSeedGuard::install);
+
     // Everything the run mutates is moved out before the rest of the request is lent to the context.
     let counter = std::mem::take(&mut request.common.counter);
     let loose_loot = std::mem::take(&mut request.loose_loot);
@@ -1774,6 +1787,49 @@ mod tests {
             .sum()
     }
 
+    /// Strips MongoIds (24 hex chars) — the ids are minted from the process-wide MongoId counter,
+    /// not the seeded RNG, so they legitimately differ between two seeded runs.
+    fn strip_mongo_ids(json: &str) -> String {
+        let mut out = String::with_capacity(json.len());
+        let mut run = String::new();
+        for c in json.chars() {
+            if c.is_ascii_hexdigit() {
+                run.push(c);
+                continue;
+            }
+            if run.len() == 24 {
+                out.push_str("<id>");
+            } else {
+                out.push_str(&run);
+            }
+            run.clear();
+            out.push(c);
+        }
+        if run.len() == 24 {
+            out.push_str("<id>");
+        } else {
+            out.push_str(&run);
+        }
+
+        out
+    }
+
+    #[test]
+    fn a_test_seed_makes_static_generation_deterministic() {
+        let mut request_a = fixture_request();
+        request_a.common.test_seed = Some(42);
+        let mut request_b = fixture_request();
+        request_b.common.test_seed = Some(42);
+
+        let result_a = generate_static_containers(request_a).unwrap();
+        let result_b = generate_static_containers(request_b).unwrap();
+
+        assert_eq!(
+            strip_mongo_ids(&serde_json::to_string(&result_a).unwrap()),
+            strip_mongo_ids(&serde_json::to_string(&result_b).unwrap())
+        );
+    }
+
     #[test]
     fn guaranteed_containers_are_always_spawned() {
         for _ in 0..25 {
@@ -1918,7 +1974,7 @@ mod tests {
         let request = fixture_request();
         let mut ctx = loot_context(&request.common, CounterState::default());
         let container_data = ContainerGroupCount {
-            container_ids_with_probability: HashMap::from([("r1".to_owned(), 0.5)]),
+            container_ids_with_probability: BTreeMap::from([("r1".to_owned(), 0.5)]),
             chosen_count: 3.0,
         };
 

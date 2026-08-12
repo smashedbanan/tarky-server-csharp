@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using NUnit.Framework;
 using SPTarkov.Server.Core.Models.Common;
 using SPTarkov.Server.Core.Models.Eft.Common;
@@ -234,6 +235,39 @@ public class LocationLootGeneratorNativeTests
         Assert.That(error!.Message, Does.Contain("native library bug, not corrupt game data"));
         // The serde parse error rides back in the same buffer the success path uses.
         Assert.That(error.Message, Does.Contain("EOF while parsing"));
+    }
+
+    [Test]
+    public void TestSeedIsOnTheWireOnlyWhenSet()
+    {
+        var withSeed = BuildStaticRequest();
+        withSeed.TestSeed = 42;
+
+        Assert.That(_jsonUtil.Serialize(withSeed), Does.Contain("\"testSeed\":42"));
+        Assert.That(_jsonUtil.Serialize(BuildStaticRequest()), Does.Not.Contain("testSeed"));
+    }
+
+    [Test]
+    public void TheSameTestSeedYieldsIdenticalResults()
+    {
+        var requestA = BuildStaticRequest();
+        requestA.TestSeed = 42;
+        var requestB = BuildStaticRequest();
+        requestB.TestSeed = 42;
+
+        var resultA = SptNative.GenerateStaticContainers(requestA);
+        var resultB = SptNative.GenerateStaticContainers(requestB);
+
+        // MongoIds are minted from the process-wide counter, not the seeded RNG — strip them.
+        static string StripMongoIds(string json)
+        {
+            return Regex.Replace(json, "[0-9a-f]{24}", "<id>");
+        }
+
+        Assert.That(
+            StripMongoIds(_jsonUtil.Serialize(resultA.Spawnpoints)!),
+            Is.EqualTo(StripMongoIds(_jsonUtil.Serialize(resultB.Spawnpoints)!))
+        );
     }
 
     /// <summary>
