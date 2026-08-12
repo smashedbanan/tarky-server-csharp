@@ -51,6 +51,21 @@ public class LocationLootGenerator(
 )
 {
     /// <summary>
+    ///     Which implementation the most recent generation call ran - the spt-native path or the
+    ///     retained 4.1.2 C# path. Test seam; also handy in a debugger.
+    /// </summary>
+    internal LootGenerationPath LastPathTaken { get; private set; }
+
+    /// <summary>
+    ///     The legacy path runs when explicitly forced by config. Task 3 extends this with Harmony
+    ///     patch detection on the protected 4.1.2 members.
+    /// </summary>
+    private bool UseLegacyPath()
+    {
+        return locationConfig.ForceLegacyLootGeneration;
+    }
+
+    /// <summary>
     /// Generate Loot for provided location ()
     /// </summary>
     /// <param name="locationId">Id of location (e.g. bigmap/factory4_day)</param>
@@ -119,6 +134,14 @@ public class LocationLootGenerator(
         Dictionary<string, IEnumerable<StaticAmmoDetails>> staticAmmoDist
     )
     {
+        if (UseLegacyPath())
+        {
+            LastPathTaken = LootGenerationPath.Legacy;
+            return GenerateStaticContainersLegacy(locationId, staticAmmoDist);
+        }
+
+        LastPathTaken = LootGenerationPath.Native;
+
         var mapData = locationTable.GetLocation(locationId);
 
         // Every `.Value` re-runs the lazy load, so each file is read exactly once per call
@@ -171,6 +194,18 @@ public class LocationLootGenerator(
         string locationName
     )
     {
+        if (UseLegacyPath())
+        {
+            LastPathTaken = LootGenerationPath.Legacy;
+            var legacyLootDist =
+                dynamicLootDist
+                ?? locationTable.GetLocation(locationName)?.LooseLoot?.Value
+                ?? throw new InvalidOperationException($"Location: {locationName} has no loose loot to generate from");
+            return GenerateDynamicLootLegacy(legacyLootDist, staticAmmoDist, locationName);
+        }
+
+        LastPathTaken = LootGenerationPath.Native;
+
         var common = BuildCommonPayload(locationName, staticAmmoDist);
 
         var result = SptNative.GenerateDynamicLoot(
@@ -1587,6 +1622,12 @@ public class LocationLootGenerator(
         items.Remove(rootItem);
         items.AddRange(magazineWithCartridges);
     }
+}
+
+internal enum LootGenerationPath
+{
+    Native,
+    Legacy,
 }
 
 public record ContainerGroupCount

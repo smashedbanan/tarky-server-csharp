@@ -10,6 +10,14 @@ public record LocationConfig : BaseConfig
     public override string Kind { get; set; } = "spt-location";
 
     /// <summary>
+    ///     Route location loot generation through the retained 4.1.2 C# implementation instead of
+    ///     spt-native. Escape hatch for mods that hook loot internals outside
+    ///     LocationLootGenerator's own members (hooks on its own members are detected automatically).
+    /// </summary>
+    [JsonPropertyName("forceLegacyLootGeneration")]
+    public bool ForceLegacyLootGeneration { get; set; }
+
+    /// <summary>
     ///     Rogues are classified as bosses and spawn immediately, this can result in no scavs spawning, delay rogues spawning to allow scavs to spawn first
     /// </summary>
     [JsonPropertyName("rogueLighthouseSpawnTimeSettings")]
