@@ -1,5 +1,7 @@
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using HarmonyLib;
 using Microsoft.Extensions.Logging;
 using SPTarkov.Common.Models.Logging;
 using SPTarkov.DI.Annotations;
@@ -57,12 +59,33 @@ public class LocationLootGenerator(
     internal LootGenerationPath LastPathTaken { get; private set; }
 
     /// <summary>
-    ///     The legacy path runs when explicitly forced by config. Task 3 extends this with Harmony
-    ///     patch detection on the protected 4.1.2 members.
+    ///     The 4.1.2 members a mod can Harmony-patch. Protected and declared on this class - exactly
+    ///     the surface the apicompat gate freezes. Computed once; patches come and go per call, so
+    ///     the check itself does not.
+    /// </summary>
+    private static readonly List<MethodBase> HookableMembers =
+    [
+        .. typeof(LocationLootGenerator)
+            .GetMethods(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)
+            .Where(method => method.IsFamily),
+    ];
+
+    /// <summary>
+    ///     The legacy path runs when forced by config, or when any of the frozen 4.1.2 members
+    ///     carries a live Harmony patch - running the retained C# implementation is the only way
+    ///     those hooks can fire with real baseline semantics.
     /// </summary>
     private bool UseLegacyPath()
     {
-        return locationConfig.ForceLegacyLootGeneration;
+        if (locationConfig.ForceLegacyLootGeneration)
+        {
+            return true;
+        }
+
+        return HookableMembers.Any(member =>
+            Harmony.GetPatchInfo(member) is { } patches
+            && (patches.Prefixes.Count > 0 || patches.Postfixes.Count > 0 || patches.Transpilers.Count > 0 || patches.Finalizers.Count > 0)
+        );
     }
 
     /// <summary>
