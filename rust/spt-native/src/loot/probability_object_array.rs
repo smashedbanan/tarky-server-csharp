@@ -75,9 +75,9 @@ impl<K: Clone + PartialEq, V> ProbabilityObjectArray<K, V> {
 
         let mut results = Vec::with_capacity(item_count_to_draw);
         for _ in 0..item_count_to_draw {
-            // `Random.Shared.NextDouble()` is a uniform over [0, 1), which is what
-            // `get_double(0.0, 1.0)` reduces to.
-            let rand = random_util::get_double(0.0, 1.0);
+            // `Random.Shared.NextDouble()` is a 53-bit uniform over [0, 1); `next_double53` is its
+            // parity twin.
+            let rand = random_util::next_double53();
 
             // `FindIndex`, so a NaN cumulative sum matches nothing and the draw is skipped.
             let Some(random_index) = cumulative_probabilities
@@ -129,7 +129,8 @@ impl<K: Clone + PartialEq, V> ProbabilityObjectArray<K, V> {
             }
 
             // Get value between 0 and the total weight to act as a target to aim for
-            let mut random_target = random_util::get_double(0.0, total_weight);
+            // C# rolls `Random.Shared.NextDouble() * totalWeight` (`ProbabilityObjectArray.cs:202`).
+            let mut random_target = random_util::next_double53() * total_weight;
 
             // Find element related to random target (greedy)
             let mut chosen_index = None;
@@ -316,5 +317,19 @@ mod tests {
 
         assert_eq!(array.data(&"a".to_string()), Some(&"data-a".to_string()));
         assert_eq!(array.data(&"missing".to_string()), None);
+    }
+
+    #[test]
+    fn a_seed_guard_makes_pool_draws_repeat() {
+        let array = pool(&[("a", 5.0), ("b", 1.0), ("c", 1.0)]);
+
+        let first = {
+            let _guard = crate::loot::random_util::TestSeedGuard::install(7);
+            (array.draw(10), array.draw_and_remove(3, None))
+        };
+        let _guard = crate::loot::random_util::TestSeedGuard::install(7);
+        let second = (array.draw(10), array.draw_and_remove(3, None));
+
+        assert_eq!(first, second);
     }
 }

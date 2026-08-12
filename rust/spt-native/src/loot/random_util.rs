@@ -4,13 +4,121 @@
 //! `rand`'s thread-local generator. What is promised is that the *distributions* and the edge-case
 //! quirks match, because the loot generator leans on both.
 
-use rand::Rng;
+use std::cell::RefCell;
+
+use rand::{RngCore, SeedableRng};
+use rand_xoshiro::Xoshiro256StarStar;
+
+thread_local! {
+    /// The test-only seeded generator; `None` means production entropy.
+    static TEST_RNG: RefCell<Option<Xoshiro256StarStar>> = const { RefCell::new(None) };
+}
+
+/// Routes every draw on this thread through a seeded xoshiro256** until dropped. Installed by the
+/// `testSeed` request field at the FFI entry points; RAII so a panic during generation cannot leak
+/// a seeded state onto a pooled thread.
+pub struct TestSeedGuard;
+
+impl TestSeedGuard {
+    pub fn install(seed: u64) -> Self {
+        TEST_RNG.with(|slot| {
+            *slot.borrow_mut() = Some(xoshiro_from_u64(seed));
+        });
+
+        Self
+    }
+}
+
+impl Drop for TestSeedGuard {
+    fn drop(&mut self) {
+        TEST_RNG.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+/// splitmix64; parity twin of `Xoshiro256StarStar.SplitMix64` in `Utils/RandomSource.cs`.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Seed expansion pinned here rather than trusting `SeedableRng::seed_from_u64`, so the C# twin
+/// replicates this exact function, not a trait default that could change underneath it.
+fn xoshiro_from_u64(seed: u64) -> Xoshiro256StarStar {
+    let mut state = seed;
+    let mut seed_bytes = [0u8; 32];
+    for chunk in seed_bytes.chunks_exact_mut(8) {
+        chunk.copy_from_slice(&splitmix64(&mut state).to_le_bytes());
+    }
+
+    Xoshiro256StarStar::from_seed(seed_bytes)
+}
+
+/// One raw draw: the seeded override when installed, thread entropy otherwise.
+fn next_u64() -> u64 {
+    TEST_RNG.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(rng) => rng.next_u64(),
+        None => rand::rng().next_u64(),
+    })
+}
+
+/// Uniform in `[0, range)` by bitmask rejection; parity twin of `SeededRandomSource.NextBelow` in
+/// `Utils/RandomSource.cs`. The canonical range algorithm both languages share — deliberately not
+/// `RandomNumberGenerator.GetInt32`'s internals nor `rand`'s.
+fn next_below(range: u64) -> u64 {
+    if range <= 1 {
+        return 0;
+    }
+    let mask = u64::MAX >> (range - 1).leading_zeros();
+    loop {
+        let value = next_u64() & mask;
+        if value < range {
+            return value;
+        }
+    }
+}
+
+/// Uniform in `[from_inclusive, to_exclusive)`; parity twin of `SeededRandomSource.GetInt32`.
+fn get_int32(from_inclusive: i32, to_exclusive: i32) -> i32 {
+    let range = (i64::from(to_exclusive) - i64::from(from_inclusive)) as u64;
+    (i64::from(from_inclusive) + next_below(range) as i64) as i32
+}
+
+/// Uniform `[0, 1)` from 48 random bits with 0 folded to 1 — the shape of
+/// `RandomUtil.GetSecureRandomNumber` (`RandomUtil.cs:465-478`); parity twin of
+/// `SeededRandomSource.NextDouble48`.
+fn next_double48() -> f64 {
+    let mut value = next_u64() & 0x0000_FFFF_FFFF_FFFF;
+    if value == 0 {
+        value = 1;
+    }
+
+    value as f64 / 281_474_976_710_656.0
+}
+
+/// Uniform `[0, 1)` from 53 random bits — the shape of `Random.Shared.NextDouble()`; parity twin
+/// of `SeededRandomSource.NextDouble53`. `ProbabilityObjectArray` draws with this, not the 48-bit
+/// helper, because its C# original does.
+pub fn next_double53() -> f64 {
+    (next_u64() >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
+}
 
 /// A random integer in `min..=max`, inclusive at both ends. `max <= min` yields `min`, matching
-/// `RandomUtil.GetInt` (`RandomUtil.cs:35-50`).
+/// `RandomUtil.GetInt` (`RandomUtil.cs:35-50`) — including its fold of `int.MaxValue` down to an
+/// exclusive bound of `int.MaxValue - 1`.
 pub fn get_int(min: i32, max: i32) -> i32 {
+    let (max, exclusive) = if max == i32::MAX {
+        (i32::MAX - 1, true)
+    } else {
+        (max, false)
+    };
+
     if max > min {
-        rand::rng().random_range(min..=max)
+        get_int32(min, if exclusive { max } else { max + 1 })
     } else {
         min
     }
@@ -18,9 +126,8 @@ pub fn get_int(min: i32, max: i32) -> i32 {
 
 /// A random float in `[min, max)`, matching `RandomUtil.GetDouble` (`RandomUtil.cs:77-81`).
 pub fn get_double(min: f64, max: f64) -> f64 {
-    // Same shape as the C#, so an inverted range walks below `min` here too instead of panicking
-    // the way `random_range` would.
-    min + rand::rng().random::<f64>() * (max - min)
+    // Same shape as the C#, so an inverted range walks below `min` here too instead of panicking.
+    min + next_double48() * (max - min)
 }
 
 /// Whether an event with `chance_percent` (0-100) fires, matching `RandomUtil.GetChance100`
@@ -41,7 +148,6 @@ pub fn get_chance_100(chance_percent: f64) -> bool {
 /// `get_double(0.01, mean * 2)` instead. This loops where the C# recurses — same count, same
 /// fallback.
 pub fn get_normally_distributed_random_number(mean: f64, sigma: f64) -> f64 {
-    let mut rng = rand::rng();
     let mut attempt = 0;
 
     loop {
@@ -49,12 +155,12 @@ pub fn get_normally_distributed_random_number(mean: f64, sigma: f64) -> f64 {
         // `ln(0)` would poison the transform.
         let mut u = 0.0;
         while u == 0.0 {
-            u = rng.random::<f64>();
+            u = next_double48();
         }
 
         let mut v = 0.0;
         while v == 0.0 {
-            v = rng.random::<f64>();
+            v = next_double48();
         }
 
         let w = (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos();
@@ -191,5 +297,54 @@ mod tests {
         assert_eq!(round_half_even(2.5), 2.0);
         assert_eq!(round_half_even(-0.5), 0.0);
         assert_eq!(round_half_even(2.4), 2.0);
+    }
+
+    #[test]
+    fn a_seed_guard_makes_every_draw_repeat_bit_for_bit() {
+        let ints_a: Vec<i32>;
+        let doubles_a: Vec<u64>;
+        {
+            let _guard = TestSeedGuard::install(42);
+            ints_a = (0..100).map(|_| get_int(1, 1000)).collect();
+            doubles_a = (0..100).map(|_| get_double(0.0, 1.0).to_bits()).collect();
+        }
+
+        let _guard = TestSeedGuard::install(42);
+        let ints_b: Vec<i32> = (0..100).map(|_| get_int(1, 1000)).collect();
+        let doubles_b: Vec<u64> = (0..100).map(|_| get_double(0.0, 1.0).to_bits()).collect();
+
+        assert_eq!(ints_a, ints_b);
+        assert_eq!(doubles_a, doubles_b);
+    }
+
+    #[test]
+    fn different_seeds_diverge() {
+        let a: Vec<i32> = {
+            let _guard = TestSeedGuard::install(1);
+            (0..20).map(|_| get_int(0, i32::MAX - 2)).collect()
+        };
+        let b: Vec<i32> = {
+            let _guard = TestSeedGuard::install(2);
+            (0..20).map(|_| get_int(0, i32::MAX - 2)).collect()
+        };
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn dropping_the_guard_restores_entropy() {
+        {
+            let _guard = TestSeedGuard::install(42);
+        }
+
+        TEST_RNG.with(|slot| assert!(slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn next_double53_stays_in_the_unit_interval() {
+        for _ in 0..1000 {
+            let value = next_double53();
+            assert!((0.0..1.0).contains(&value), "{value} escaped [0, 1)");
+        }
     }
 }
