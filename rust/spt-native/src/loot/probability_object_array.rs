@@ -332,4 +332,49 @@ mod tests {
 
         assert_eq!(first, second);
     }
+
+    /// Twin of `print_kat_vectors` in random_util.rs, for the pool draws. Run:
+    /// `cargo test -p spt-native --lib print_pool_kat_vectors -- --ignored --nocapture`
+    #[test]
+    #[ignore = "generator for the pinned KAT constants, not an assertion"]
+    fn print_pool_kat_vectors() {
+        let array = pool(&[("a", 5.0), ("b", 1.0), ("c", 1.0)]);
+
+        let draw5 = {
+            let _g = crate::loot::random_util::TestSeedGuard::install(42);
+            array.draw(5)
+        };
+        let draw_and_remove3 = {
+            let _g = crate::loot::random_util::TestSeedGuard::install(42);
+            array.draw_and_remove(3, None)
+        };
+
+        println!("POOL_DRAW5: {draw5:?}");
+        println!("POOL_DRAW_AND_REMOVE3: {draw_and_remove3:?}");
+    }
+
+    #[test]
+    fn kat_pool_draws_are_pinned() {
+        // Twin assertions live in RandomSourceParityTests.cs (C#).
+        let array = pool(&[("a", 5.0), ("b", 1.0), ("c", 1.0)]);
+
+        {
+            let _g = crate::loot::random_util::TestSeedGuard::install(42);
+            assert_eq!(
+                array.draw(5),
+                vec![
+                    "a".to_string(),
+                    "a".to_string(),
+                    "a".to_string(),
+                    "c".to_string(),
+                    "c".to_string()
+                ]
+            );
+        }
+        let _g = crate::loot::random_util::TestSeedGuard::install(42);
+        assert_eq!(
+            array.draw_and_remove(3, None),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
 }

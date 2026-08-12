@@ -347,4 +347,126 @@ mod tests {
             assert!((0.0..1.0).contains(&value), "{value} escaped [0, 1)");
         }
     }
+
+    /// Generates the cross-language KAT constants. Run:
+    /// `cargo test -p spt-native --lib print_kat_vectors -- --ignored --nocapture`
+    /// and paste each printed line into the KAT constants below and into
+    /// `Testing/UnitTests/Tests/Utils/RandomSourceParityTests.cs`.
+    #[test]
+    #[ignore = "generator for the pinned KAT constants, not an assertion"]
+    fn print_kat_vectors() {
+        fn hex(values: &[u64]) -> String {
+            let items: Vec<String> = values.iter().map(|v| format!("0x{v:016X}")).collect();
+            items.join(", ")
+        }
+
+        let raw: Vec<u64> = {
+            let _g = TestSeedGuard::install(42);
+            (0..4).map(|_| next_u64()).collect()
+        };
+        let d48: Vec<u64> = {
+            let _g = TestSeedGuard::install(42);
+            (0..3).map(|_| next_double48().to_bits()).collect()
+        };
+        let d53: Vec<u64> = {
+            let _g = TestSeedGuard::install(42);
+            (0..3).map(|_| next_double53().to_bits()).collect()
+        };
+        let fill5: Vec<u8> = {
+            let _g = TestSeedGuard::install(42);
+            next_u64().to_le_bytes()[..5].to_vec()
+        };
+        let ints: Vec<i32> = {
+            let _g = TestSeedGuard::install(42);
+            (0..5).map(|_| get_int(1, 10)).collect()
+        };
+        let doubles: Vec<u64> = {
+            let _g = TestSeedGuard::install(42);
+            (0..3).map(|_| get_double(0.0, 100.0).to_bits()).collect()
+        };
+        let chances: Vec<bool> = {
+            let _g = TestSeedGuard::install(42);
+            (0..5).map(|_| get_chance_100(50.0)).collect()
+        };
+
+        println!("RAW_U64: [{}]", hex(&raw));
+        println!("NEXT_DOUBLE48_BITS: [{}]", hex(&d48));
+        println!("NEXT_DOUBLE53_BITS: [{}]", hex(&d53));
+        println!("FILL5: {fill5:#04X?}");
+        println!("GET_INT_1_10: {ints:?}");
+        println!("GET_DOUBLE_0_100_BITS: [{}]", hex(&doubles));
+        println!("GET_CHANCE100_50: {chances:?}");
+    }
+
+    // ---- Cross-language KAT pins. Twin fixture: RandomSourceParityTests.cs (C#). ----
+    // Regenerate with `print_kat_vectors` only if a derivation changes deliberately — and then
+    // update the C# twin in the same commit.
+
+    const KAT_SEED: u64 = 42;
+    const KAT_RAW_U64: [u64; 4] = [
+        0x1578_0B2E_0C2E_C716,
+        0x6104_D986_6D11_3A7E,
+        0xAE17_5332_39E4_99A1,
+        0xECB8_AD47_03B3_60A1,
+    ];
+    const KAT_NEXT_DOUBLE48_BITS: [u64; 3] = [
+        0x3FA6_5C18_5D8E_2C00,
+        0x3FEB_30CD_A227_4FC0,
+        0x3FD4_CC8E_7926_6840,
+    ];
+    const KAT_NEXT_DOUBLE53_BITS: [u64; 3] = [
+        0x3FB5_780B_2E0C_2EC0,
+        0x3FD8_4136_619B_444E,
+        0x3FE5_C2EA_6647_3C93,
+    ];
+    const KAT_FILL5: [u8; 5] = [0x16, 0xC7, 0x2E, 0x0C, 0x2E];
+    const KAT_GET_INT_1_10: [i32; 5] = [7, 2, 2, 5, 9];
+    const KAT_GET_DOUBLE_0_100_BITS: [u64; 3] = [
+        0x4011_77F3_0917_1260,
+        0x4055_3E20_A6AE_B64E,
+        0x4040_3FCF_4EA6_0172,
+    ];
+    const KAT_GET_CHANCE100_50: [bool; 5] = [true, true, true, false, false];
+
+    #[test]
+    fn kat_raw_u64_sequence_is_pinned() {
+        let _g = TestSeedGuard::install(KAT_SEED);
+        let raw: Vec<u64> = (0..4).map(|_| next_u64()).collect();
+        assert_eq!(raw, KAT_RAW_U64);
+    }
+
+    #[test]
+    fn kat_double_derivations_are_pinned() {
+        {
+            let _g = TestSeedGuard::install(KAT_SEED);
+            let bits: Vec<u64> = (0..3).map(|_| next_double48().to_bits()).collect();
+            assert_eq!(bits, KAT_NEXT_DOUBLE48_BITS);
+        }
+        let _g = TestSeedGuard::install(KAT_SEED);
+        let bits: Vec<u64> = (0..3).map(|_| next_double53().to_bits()).collect();
+        assert_eq!(bits, KAT_NEXT_DOUBLE53_BITS);
+    }
+
+    #[test]
+    fn kat_fill_bytes_are_pinned() {
+        let _g = TestSeedGuard::install(KAT_SEED);
+        assert_eq!(next_u64().to_le_bytes()[..5], KAT_FILL5);
+    }
+
+    #[test]
+    fn kat_public_draws_are_pinned() {
+        {
+            let _g = TestSeedGuard::install(KAT_SEED);
+            let ints: Vec<i32> = (0..5).map(|_| get_int(1, 10)).collect();
+            assert_eq!(ints, KAT_GET_INT_1_10);
+        }
+        {
+            let _g = TestSeedGuard::install(KAT_SEED);
+            let bits: Vec<u64> = (0..3).map(|_| get_double(0.0, 100.0).to_bits()).collect();
+            assert_eq!(bits, KAT_GET_DOUBLE_0_100_BITS);
+        }
+        let _g = TestSeedGuard::install(KAT_SEED);
+        let chances: Vec<bool> = (0..5).map(|_| get_chance_100(50.0)).collect();
+        assert_eq!(chances, KAT_GET_CHANCE100_50);
+    }
 }
