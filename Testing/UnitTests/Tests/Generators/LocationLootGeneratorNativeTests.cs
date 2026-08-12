@@ -250,24 +250,85 @@ public class LocationLootGeneratorNativeTests
     [Test]
     public void TheSameTestSeedYieldsIdenticalResults()
     {
-        var requestA = BuildStaticRequest();
-        requestA.TestSeed = 42;
-        var requestB = BuildStaticRequest();
-        requestB.TestSeed = 42;
-
-        var resultA = SptNative.GenerateStaticContainers(requestA);
-        var resultB = SptNative.GenerateStaticContainers(requestB);
-
         // MongoIds are minted from the process-wide counter, not the seeded RNG — strip them.
         static string StripMongoIds(string json)
         {
             return Regex.Replace(json, "[0-9a-f]{24}", "<id>");
         }
 
-        Assert.That(
-            StripMongoIds(_jsonUtil.Serialize(resultA.Spawnpoints)!),
-            Is.EqualTo(StripMongoIds(_jsonUtil.Serialize(resultB.Spawnpoints)!))
-        );
+        // Swept over seeds rather than repeated on one: a fixed seed replays the same draw values,
+        // so an ordering hazard whose draws coincide under that seed would stay invisible however
+        // often it ran.
+        for (ulong seed = 0; seed < 10; seed++)
+        {
+            var requestA = BuildGroupedStaticRequest();
+            requestA.TestSeed = seed;
+            var requestB = BuildGroupedStaticRequest();
+            requestB.TestSeed = seed;
+
+            var resultA = SptNative.GenerateStaticContainers(requestA);
+            var resultB = SptNative.GenerateStaticContainers(requestB);
+
+            // Guards the fixture itself: one spawnpoint means only the guaranteed container came
+            // back and the container-group path never ran, which would make the comparison hollow.
+            Assert.That(resultA.Spawnpoints, Has.Count.GreaterThan(1), $"seed {seed} never reached the container-group path");
+            Assert.That(
+                StripMongoIds(_jsonUtil.Serialize(resultA.Spawnpoints)!),
+                Is.EqualTo(StripMongoIds(_jsonUtil.Serialize(resultB.Spawnpoints)!)),
+                $"seed {seed} did not reproduce"
+            );
+        }
+    }
+
+    /// <summary>
+    /// <see cref="BuildStaticRequest"/> plus three randomisable containers split across two groups
+    /// whose bounds differ. <see cref="BuildStaticRequest"/> leaves <c>Statics</c> null, so
+    /// generation returns straight after the guaranteed container and never reaches the
+    /// container-group code the seed most needs to pin down.
+    /// </summary>
+    private static StaticContainersRequest BuildGroupedStaticRequest()
+    {
+        var request = BuildStaticRequest();
+
+        request.StaticContainers =
+        [
+            .. request.StaticContainers!,
+            BuildRandomisableContainer("r1"),
+            BuildRandomisableContainer("r2"),
+            BuildRandomisableContainer("r3"),
+        ];
+        request.Statics = new StaticContainer
+        {
+            ContainersGroups = new Dictionary<string, ContainerMinMax>
+            {
+                ["g1"] = new ContainerMinMax { MinContainers = 1, MaxContainers = 2 },
+                ["g2"] = new ContainerMinMax { MinContainers = 1, MaxContainers = 2 },
+            },
+            Containers = new Dictionary<string, ContainerData>
+            {
+                ["r1"] = new ContainerData { GroupId = "g1" },
+                ["r2"] = new ContainerData { GroupId = "g1" },
+                ["r3"] = new ContainerData { GroupId = "g2" },
+            },
+        };
+
+        return request;
+    }
+
+    private static StaticContainerData BuildRandomisableContainer(string spawnpointId)
+    {
+        return new StaticContainerData
+        {
+            // Under 1, so the container is randomised rather than guaranteed
+            Probability = 0.5f,
+            Template = new SpawnpointTemplate
+            {
+                Id = spawnpointId,
+                IsContainer = true,
+                Root = new MongoId().ToString(),
+                Items = [new SptLootItem { Id = new MongoId(), Template = _containerTpl }],
+            },
+        };
     }
 
     /// <summary>

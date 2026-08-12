@@ -11,7 +11,7 @@
 //! * Request/response envelopes — a new contract between the C# caller and this crate, so they are
 //!   plain camelCase with no passthrough map.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -288,8 +288,12 @@ pub struct StaticAmmoDetails {
 /// `Models/Eft/Common/Location.cs`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StaticContainer {
+    /// `BTreeMap`, not `HashMap`: `get_group_id_to_container_mappings` draws a `get_int` per group
+    /// as it walks this map, so a randomised iteration order hands different groups different draws
+    /// and leaves generation non-reproducible even under a fixed `test_seed`.
     #[serde(rename = "containersGroups", skip_serializing_if = "Option::is_none")]
-    pub containers_groups: Option<HashMap<String, ContainerMinMax>>,
+    pub containers_groups: Option<BTreeMap<String, ContainerMinMax>>,
+    /// Keyed lookups only, so iteration order never reaches the RNG.
     #[serde(rename = "containers", skip_serializing_if = "Option::is_none")]
     pub containers: Option<HashMap<String, ContainerData>>,
     #[serde(flatten)]
@@ -424,8 +428,12 @@ pub struct SeasonalView {
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CounterState {
+    /// Keyed lookups only, so iteration order never reaches the RNG or the wire.
     pub max_counts: HashMap<String, i32>,
-    pub tracked_counts: HashMap<String, i32>,
+    /// `BTreeMap`, not `HashMap`: this rides back out on both result envelopes, and a randomised
+    /// iteration order would make the serialised result differ between two seeded runs. C#
+    /// deserialises it into a `Dictionary` either way.
+    pub tracked_counts: BTreeMap<String, i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,7 +484,7 @@ pub struct Diagnostic {
 #[serde(rename_all = "camelCase")]
 pub struct StaticContainersResult {
     pub spawnpoints: Vec<SpawnpointTemplate>,
-    pub tracked_counts: HashMap<String, i32>,
+    pub tracked_counts: BTreeMap<String, i32>,
     pub static_loot_item_count: i32,
     pub static_container_count: i32,
     pub diagnostics: Vec<Diagnostic>,
@@ -486,7 +494,7 @@ pub struct StaticContainersResult {
 #[serde(rename_all = "camelCase")]
 pub struct DynamicLootResult {
     pub spawnpoints: Vec<SpawnpointTemplate>,
-    pub tracked_counts: HashMap<String, i32>,
+    pub tracked_counts: BTreeMap<String, i32>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -671,7 +679,7 @@ mod tests {
     fn results_serialize_with_camel_case_keys() {
         let out = serde_json::to_value(StaticContainersResult {
             spawnpoints: vec![],
-            tracked_counts: HashMap::from([("tpl".to_owned(), 1)]),
+            tracked_counts: BTreeMap::from([("tpl".to_owned(), 1)]),
             static_loot_item_count: 4,
             static_container_count: 2,
             diagnostics: vec![Diagnostic {

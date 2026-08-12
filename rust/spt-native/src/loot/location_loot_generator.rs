@@ -1814,20 +1814,59 @@ mod tests {
         out
     }
 
+    /// `fixture_request()` with two container groups whose bounds differ. The base fixture's single
+    /// `minContainers == maxContainers` group makes `get_int` short-circuit without drawing, which
+    /// hides the per-group draw in `get_group_id_to_container_mappings` — the order-sensitive path.
+    fn multi_group_fixture() -> StaticContainersRequest {
+        let mut request = fixture_request();
+        let statics = request.statics.as_mut().expect("fixture has statics");
+
+        statics.containers_groups = Some(
+            serde_json::from_value(json!({
+                "g1": { "minContainers": 1, "maxContainers": 2 },
+                "g2": { "minContainers": 1, "maxContainers": 2 },
+            }))
+            .unwrap(),
+        );
+        statics.containers = Some(
+            serde_json::from_value(json!({
+                "r1": { "groupId": "g1" },
+                "r2": { "groupId": "g1" },
+                "r3": { "groupId": "g2" },
+            }))
+            .unwrap(),
+        );
+
+        // Ceilings high enough never to bite, purely so several tpls land in `trackedCounts` — it
+        // stays empty under the base fixture, which would hide its ordering from the comparison.
+        request.common.counter.max_counts = [MONEY_TPL, AMMO_BOX_TPL, MAGAZINE_TPL]
+            .into_iter()
+            .map(|tpl| (tpl.to_owned(), 9999))
+            .collect();
+
+        request
+    }
+
     #[test]
     fn a_test_seed_makes_static_generation_deterministic() {
-        let mut request_a = fixture_request();
-        request_a.common.test_seed = Some(42);
-        let mut request_b = fixture_request();
-        request_b.common.test_seed = Some(42);
+        // Swept over seeds, not repeated on one: a fixed seed replays the same draw values every
+        // iteration, so an order hazard whose two draws happen to coincide under that one seed
+        // would stay invisible no matter how often it ran. Varying the seed varies the values, so
+        // a regression to `HashMap` on the container-group map or `trackedCounts` surfaces.
+        for seed in 0..25 {
+            let mut request_a = multi_group_fixture();
+            request_a.common.test_seed = Some(seed);
+            let mut request_b = multi_group_fixture();
+            request_b.common.test_seed = Some(seed);
 
-        let result_a = generate_static_containers(request_a).unwrap();
-        let result_b = generate_static_containers(request_b).unwrap();
+            let result_a = generate_static_containers(request_a).unwrap();
+            let result_b = generate_static_containers(request_b).unwrap();
 
-        assert_eq!(
-            strip_mongo_ids(&serde_json::to_string(&result_a).unwrap()),
-            strip_mongo_ids(&serde_json::to_string(&result_b).unwrap())
-        );
+            assert_eq!(
+                strip_mongo_ids(&serde_json::to_string(&result_a).unwrap()),
+                strip_mongo_ids(&serde_json::to_string(&result_b).unwrap())
+            );
+        }
     }
 
     #[test]
