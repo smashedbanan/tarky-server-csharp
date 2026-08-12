@@ -63,7 +63,7 @@ public class LocationLootGenerator(
     ///     the surface the apicompat gate freezes. Computed once; patches come and go per call, so
     ///     the check itself does not.
     /// </summary>
-    private static readonly List<MethodBase> HookableMembers =
+    private static readonly List<MethodBase> _hookableMembers =
     [
         .. typeof(LocationLootGenerator)
             .GetMethods(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)
@@ -82,7 +82,7 @@ public class LocationLootGenerator(
             return true;
         }
 
-        return HookableMembers.Any(member =>
+        return _hookableMembers.Any(member =>
             Harmony.GetPatchInfo(member) is { } patches
             && (patches.Prefixes.Count > 0 || patches.Postfixes.Count > 0 || patches.Transpilers.Count > 0 || patches.Finalizers.Count > 0)
         );
