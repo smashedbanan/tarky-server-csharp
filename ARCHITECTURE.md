@@ -229,9 +229,15 @@ shipping a wrong-triple library. Only `linux-x64` is mapped — arm64 is not a s
 
 ### Location loot generation
 
-`Generators/Loot/LocationLootGenerator` is `[Injectable]` and keeps the pre-port signatures of its
-three public methods (`GenerateLocationLoot`, `GenerateStaticContainers`, `GenerateDynamicLoot`),
-but holds no generation logic. Each call projects the live database, config and services into a JSON
+`Generators/Loot/LocationLootGenerator` is `[Injectable]` and keeps its complete 4.1.2 surface —
+the three public entry points, the constructor, the protected helpers and the
+`ContainerGroupCount`/`ContainerItem` DTOs, all apicompat-gated against the frozen 4.1.2
+baseline. By default the entry points hold no generation logic themselves: each call projects the
+live database, config and services into a JSON payload and hands it to the native side. The full
+4.1.2 implementation is retained in the class as the **legacy path**, taken when HarmonyX reports
+a patch on any of the protected members or when `location.json`'s `forceLegacyLootGeneration` is
+set — a mod hook on loot internals then fires with genuine baseline semantics at baseline speed.
+Each call projects the live database, config and services into a JSON
 payload, hands it to `spt_generate_static_containers` or `spt_generate_dynamic_loot`, and replays
 the log lines the native side collected instead of writing itself — `ReplayDiagnostics` resolves a
 level plus a locale key and its args back through `ServerLocalisationService`. Rolling, packing and
@@ -317,3 +323,38 @@ are the intended next ports — must keep an `[Injectable]` service as its entry
 call made from inside it, as `LocationLootGenerator` does. An instance method on a resolved service
 can be patched by `SPTarkov.Reflection` and its registration replaced; a static class can be neither
 patched, mocked, nor overridden.
+
+### Porting playbook
+
+The rules every Rust cutover follows, learned from the loot port. The contract they protect:
+binary compatibility with mods compiled against the frozen 4.1.2 assemblies, enforced by the
+`dotnet apicompat` gate in the sibling `mpex-api-compat` repo.
+
+1. **Frozen surface.** A port must preserve the ported class's entire 4.1.2 public *and
+   protected* surface: constructor signature including parameter names (the gate runs with
+   `--enable-rule-cannot-change-parameter-name`), methods, and DTO types. Entry points forward to
+   Rust; the class's 4.1.2 implementation is retained verbatim as a legacy path, not deleted.
+2. **Override contract.** Hooks on the ported class's own members are fully supported: the entry
+   points detect Harmony patches on the frozen members (`Harmony.GetPatchInfo`) and run the legacy
+   path so hooks fire with baseline semantics. Each port also adds a `forceLegacy...` config flag
+   as the escape hatch for hooks the detection can't see (patches on *collaborators'* internals
+   that only the old C# call graph reached). Data-driven mods need nothing special: payloads are
+   projected from the live database per call, so table/config mutations are always honoured.
+   `TypePriority` class replacement behaves as on 4.1.2 (members are non-virtual there too).
+3. **RNG/behavior parity** (adopted policy, not yet implemented): a Rust `DotNetRandom`
+   (`rand_xoshiro` xoshiro256** core replicating .NET `Random` semantics) plus test-only seed
+   plumbing on both sides, enabling golden tests — same seed, bit-identical output, with the
+   retained legacy path as the executable oracle. Until then: the legacy path is verbatim shipped
+   4.1.2 code, and the native path keeps its structural and perf pins.
+4. **FFI/ABI.** The JSON payload envelopes are internal contracts between this repo's C# and this
+   repo's Rust, shipped in lockstep — change them freely, bump `spt_native_abi_version` every
+   time. No third-party consumer of the cdylib is supported; the only frozen contract is the
+   managed surface. Binding-generation crates (e.g. interoptopus) are welcome where they delete
+   hand-rolled unsafe plumbing; the existing hand-rolled loot boundary stays.
+5. **Gate loop.** No CI exists in this fork, so every cutover ends with the manual sequence:
+   `dotnet build server-csharp.slnx -c Release` → `mpex-api-compat/ci/check-api-compat.sh` (all
+   six assemblies clean) → `dotnet test` → `csharpier format .` before merge.
+
+Agreed port order: mod-compat test gaps (`todo/TODO-TESTING.md`), RNG parity, then
+`LootGenerator.cs` to finish loot, then the bot family and ragfair per `todo/TODO.md`. The
+checks.dat generate path (`todo/TODO.md` #12) is a detached quick win.
