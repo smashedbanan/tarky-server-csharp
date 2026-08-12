@@ -38,9 +38,9 @@ public class LootHookLivenessTests
         Assert.That(target, Is.Not.Null, "restored protected member CreateStaticLootItem not found");
 
         _patchFired = false;
-        harmony.Patch(target, postfix: new HarmonyMethod(typeof(LootHookLivenessTests), nameof(Postfix)));
         try
         {
+            harmony.Patch(target, postfix: new HarmonyMethod(typeof(LootHookLivenessTests), nameof(Postfix)));
             _locationLootGenerator.GenerateLocationLoot(LocationId);
 
             Assert.That(_locationLootGenerator.LastPathTaken, Is.EqualTo(LootGenerationPath.Legacy));
