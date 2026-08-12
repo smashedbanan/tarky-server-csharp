@@ -237,9 +237,9 @@ live database, config and services into a JSON payload and hands it to the nativ
 4.1.2 implementation is retained in the class as the **legacy path**, taken when HarmonyX reports
 a patch on any of the protected members or when `location.json`'s `forceLegacyLootGeneration` is
 set — a mod hook on loot internals then fires with genuine baseline semantics at baseline speed.
-Each call projects the live database, config and services into a JSON
-payload, hands it to `spt_generate_static_containers` or `spt_generate_dynamic_loot`, and replays
-the log lines the native side collected instead of writing itself — `ReplayDiagnostics` resolves a
+On the native path, that payload is handed to `spt_generate_static_containers` or
+`spt_generate_dynamic_loot`, which replays the log lines the native side collected instead of
+writing itself — `ReplayDiagnostics` resolves a
 level plus a locale key and its args back through `ServerLocalisationService`. Rolling, packing and
 item assembly live in `rust/spt-native/src/loot/`; `Native/Loot/LootPayloads.cs` mirrors
 `loot/models.rs` member for member. The DB/EFT models in `loot/models.rs` — `Item`,
@@ -280,8 +280,12 @@ transformer, throws rather than generating from nothing.
 **Preserved for mods.**
 
 - Runtime patches on the three public methods (`SPTarkov.Reflection`), arguments and results
-  included. For this class that is *the* behaviour-replacement channel — see the note on subclassing
-  below.
+  included — Harmony wraps the call regardless of which path runs underneath. Patches on any
+  protected helper are honoured too: `UseLegacyPath()` detects a live patch on any of them
+  (`Harmony.GetPatchInfo`) and routes the call to the retained legacy path so it runs with real
+  4.1.2 semantics; `location.json`'s `forceLegacyLootGeneration` forces the same path for hooks the
+  detection can't see. See the note on subclassing below for what a patch-free subclass still can't
+  do.
 - Every form of data mutation: database tables, `SPT_Data` JSON, the configs the payload reads, and
   `LazyLoad` transformers, which are the supported channel for changing loose loot.
 - Whatever the services behind the payload return at call time — `ItemFilterService`,
@@ -291,22 +295,25 @@ transformer, throws rather than generating from nothing.
   spawn points, containers — which ride through the Rust `extra` maps in both directions. Fields
   added at the envelope level are dropped, in both directions.
 
-**Broken for mods.**
+**Still limited for mods.**
 
-- The 16 protected methods that used to hold the generation logic are gone. A subclass overriding
-  them fails to compile and a patch naming them fails to apply, rather than silently doing nothing.
-- The two public types they used, `ContainerGroupCount` and `ContainerItem`, are gone with them: a
-  compile break for anything that named them.
-- The constructor no longer takes `RandomUtil` and now takes `TemplateTable` — visible to subclasses
-  at compile time.
-- Subclassing to change what generation does. The three public methods are not virtual and
-  `LocationLifecycleService` injects the concrete `LocationLootGenerator`, so a subclass registered
-  over it is constructed and injected but its bodies never run for those calls. Patch instead.
-- `RandomUtil` is not consulted for loot rolls at all: every roll happens natively.
-- `ItemHelper` is not consulted inside loot generation beyond `GetMoneyTpls`, so patches on it do not
-  reach the items view — database edits still land, changes to its code do not.
-- `CounterTrackerHelper.IncrementCount` is not invoked per item; only the counts round-trip, so
-  per-item logic patched into it never runs during generation.
+- The full 4.1.2 surface is restored and apicompat-gated — the constructor (including
+  `RandomUtil`), the protected helpers, and the `ContainerGroupCount`/`ContainerItem` DTOs are all
+  back, so a subclass or patch naming any of them compiles and applies again. What still doesn't
+  reach the native path is a patch on a *collaborator's* internals — `RandomUtil`, `ItemHelper`,
+  `CounterTrackerHelper` — that the old C# call graph reached: `UseLegacyPath()` only watches this
+  class's own protected members, so those collaborator patches are invisible to it.
+  `RandomUtil` is not consulted for loot rolls at all on the native path, `ItemHelper` is not
+  consulted beyond `GetMoneyTpls`, and `CounterTrackerHelper.IncrementCount` is not invoked per item
+  (only the aggregate counts round-trip) — patches on those methods only take effect once
+  `forceLegacyLootGeneration` (or a patch on this class's own protected members) routes the call to
+  the legacy path.
+- No RNG sequence parity between the two paths yet (Porting playbook, rule 3): even unpatched, a
+  native roll and a legacy roll are not bit-identical for the same seed.
+- Subclassing to change what generation does. The three public methods are not virtual — matching
+  4.1.2, where they weren't either — and `LocationLifecycleService` injects the concrete
+  `LocationLootGenerator`, so a subclass registered over it is constructed and injected but its
+  bodies never run for those calls. Patch instead.
 - A patch on `GenerateDynamicLoot` that mutates its `dynamicLootDist` **argument** is not honoured on
   the raw path, where that argument is null. Register a `LazyLoad` transformer instead — which also
   puts that map on the typed path.
