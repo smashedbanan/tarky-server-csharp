@@ -52,4 +52,23 @@ public class ModCompatibilityTests
 
         Assert.That(routers.Any(router => router.CanHandle("/testmod/ping")), Is.True);
     }
+
+    [Test]
+    public void ModHarmonyPatch_PatchesAndUnpatchesCleanly()
+    {
+        var target = new TestModHarmonyPatchTarget();
+        var patch = new TestModHarmonyPatch();
+
+        try
+        {
+            patch.Activate();
+            Assert.That(target.GetValue(), Is.EqualTo(2), "postfix should rewrite the return value while the patch is active");
+        }
+        finally
+        {
+            patch.Deactivate();
+        }
+
+        Assert.That(target.GetValue(), Is.EqualTo(1), "original behavior should be restored after Disable");
+    }
 }
