@@ -1,8 +1,10 @@
 //! The draw semantics of `Utils/RandomUtil.cs`, ported bug-for-bug.
 //!
-//! No RNG-sequence parity with C# is promised — the C# draws come from a CSPRNG, these come from
-//! `rand`'s thread-local generator. What is promised is that the *distributions* and the edge-case
-//! quirks match, because the loot generator leans on both.
+//! Production draws come from thread entropy, as the C# ones come from a CSPRNG — no sequence
+//! parity between unseeded runs. Under a [`TestSeedGuard`] (installed by the `testSeed` request
+//! field) every draw instead comes from a seeded xoshiro256** whose sequences are bit-identical
+//! to `SeededRandomSource` in `Utils/RandomSource.cs`, pinned by the KAT tests below and by
+//! `RandomSourceParityTests.cs`.
 
 use std::cell::RefCell;
 
@@ -151,8 +153,8 @@ pub fn get_normally_distributed_random_number(mean: f64, sigma: f64) -> f64 {
     let mut attempt = 0;
 
     loop {
-        // The C# CSPRNG helper folds 0 to 1 so it can never hand back 0.0; `rand` can, and
-        // `ln(0)` would poison the transform.
+        // `next_double48` already folds 0 to 1, as the C# helper does, so neither loop can spin;
+        // they are kept for bug-for-bug shape parity with the C#.
         let mut u = 0.0;
         while u == 0.0 {
             u = next_double48();

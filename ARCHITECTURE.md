@@ -308,8 +308,9 @@ transformer, throws rather than generating from nothing.
   (only the aggregate counts round-trip) — patches on those methods only take effect once
   `forceLegacyLootGeneration` (or a patch on this class's own protected members) routes the call to
   the legacy path.
-- No RNG sequence parity between the two paths yet (Porting playbook, rule 3): even unpatched, a
-  native roll and a legacy roll are not bit-identical for the same seed.
+- No RNG sequence parity between the two paths yet (Porting playbook, rule 3): even unpatched and
+  under the same test seed, a native roll and a legacy roll are not bit-identical — the shared
+  seedable RNG pins the draw primitives, not the draw order.
 - Subclassing to change what generation does. The three public methods are not virtual — matching
   4.1.2, where they weren't either — and `LocationLifecycleService` injects the concrete
   `LocationLootGenerator`, so a subclass registered over it is constructed and injected but its
@@ -348,11 +349,18 @@ binary compatibility with mods compiled against the frozen 4.1.2 assemblies, enf
    that only the old C# call graph reached). Data-driven mods need nothing special: payloads are
    projected from the live database per call, so table/config mutations are always honoured.
    `TypePriority` class replacement behaves as on 4.1.2 (members are non-virtual there too).
-3. **RNG/behavior parity** (adopted policy, not yet implemented): a Rust `DotNetRandom`
-   (`rand_xoshiro` xoshiro256** core replicating .NET `Random` semantics) plus test-only seed
-   plumbing on both sides, enabling golden tests — same seed, bit-identical output, with the
-   retained legacy path as the executable oracle. Until then: the legacy path is verbatim shipped
-   4.1.2 code, and the native path keeps its structural and perf pins.
+3. **RNG/behavior parity** (primitive level implemented; full-output golden tests pending): both
+   sides share one seedable test RNG — xoshiro256** (`rand_xoshiro` in Rust, an internal twin
+   class in `Utils/RandomSource.cs`) seeded from a u64 via splitmix64 — behind test-only seams.
+   `RandomUtil` and `ProbabilityObjectArray` draw through an internal swappable `IRandomSource`;
+   the Rust `random_util` draws through a thread-local override installed per call by the
+   optional `testSeed` request field (safe because each generation call runs synchronously on
+   the calling thread). Identical derivation functions on both sides are pinned bit-for-bit by
+   twin known-answer tests (`RandomSourceParityTests.cs` / the KAT tests in `random_util.rs`).
+   Production randomness is untouched: crypto statics on C#, thread entropy in Rust. Still
+   pending: full-output golden tests — same seed, bit-identical loot output with the retained
+   legacy path as the executable oracle — which additionally require draw-order alignment
+   between the legacy and native paths.
 4. **FFI/ABI.** The JSON payload envelopes are internal contracts between this repo's C# and this
    repo's Rust, shipped in lockstep — change them freely, bump `spt_native_abi_version` every
    time. No third-party consumer of the cdylib is supported; the only frozen contract is the
