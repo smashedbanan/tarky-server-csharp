@@ -12,6 +12,7 @@ using SPTarkov.Server.Core.Models.Spt.Config;
 using SPTarkov.Server.Core.Models.Spt.Mod;
 using SPTarkov.Server.Core.Models.Spt.Tables;
 using SPTarkov.Server.Core.Services.Hosted;
+using SPTarkov.Server.Extensions;
 using SPTarkov.Server.Helpers;
 using UnitTests.Mock;
 
@@ -114,6 +115,8 @@ public class DI
         }
 
         diHandler.InjectAll();
+
+        services.AddModDIConstructorsAsync(modAssemblies).GetAwaiter().GetResult();
 
         services.AddSingleton<IReadOnlyList<SptMod>>(_ => []);
 
